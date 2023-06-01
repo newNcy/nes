@@ -23,10 +23,13 @@ typedef struct {
 }rom_t;
 
 
-typedef struct bus_device_t{
-    uint16_t address_start;
-    uint16_t address_end;
-    uint8_t * memory;
+typedef void (*device_io_t)(void * device, uint16_t address, uint8_t * data, uint8_t is_write);
+
+typedef struct bus_device_t {
+    uint16_t start;
+    uint16_t end;
+    void * device;
+    device_io_t device_io;
     struct bus_device_t * next;
 }bus_device_t;
 
@@ -34,9 +37,13 @@ typedef struct {
     bus_device_t * devices;
 }bus_t;
 
-enum {
+typedef enum {
     C, Z, I, D, B, V = 6, N
-};
+}cpu_flag_t;
+
+typedef enum {
+    NMI, RESET, IRQ, BRK
+}cpu_int_t;
 
 typedef struct {
     uint16_t PC;
@@ -46,6 +53,7 @@ typedef struct {
     uint8_t Y;
     uint8_t P;
     bus_t bus;
+    uint8_t * ram;
 }cpu_t;
 
 
@@ -54,64 +62,69 @@ typedef struct {
     cpu_t cpu;
 }nes_t;
 
-int take_bit(uint8_t byte, uint8_t bit) {
+int bit_get(uint8_t byte, uint8_t bit) {
     return (byte>>bit)&1;
 }
 
-int set_bit(uint8_t byte, uint8_t bit, uint8_t v)
+void bit_set(uint8_t * byte, uint8_t bit)
 {
-    uint8_t m = 1<<bit;
-    if (v) {
-        return byte |  m;
-    } 
-    return byte & ~m;
+    *byte |= (1<<bit);
 }
 
-bus_device_t * make_bus_device(uint16_t start, uint16_t end) 
+void bit_clr(uint8_t * byte, uint8_t bit)
 {
-    bus_device_t * device = (bus_device_t*)malloc(sizeof (bus_device_t));
-    device->address_start = start;
-    device->address_end = end;
-    device->memory = malloc(end-start);
-    device->next = NULL;
-    return device;
+
+    *byte &= ~(1<<bit);
 }
 
-void bus_mount(bus_t * bus, bus_device_t * new_device)
+void memory_io(void * memory, uint16_t offset, uint8_t * data, uint8_t is_write)
 {
+    uint8_t * bytes = (uint8_t*)memory;
+    if (is_write) {
+        bytes[offset] = *data;
+    }else {
+        *data = bytes[offset];
+    }
+}
+
+void bus_mount(bus_t * bus, void * device, uint16_t start, uint16_t end, device_io_t device_io)
+{
+    bus_device_t * mount = (bus_device_t*)malloc(sizeof(bus_device_t));
+    memset(mount, 0, sizeof(bus_device_t));
+    mount->start = start;
+    mount->end = end;
+    mount->device = device;
+    mount->device_io = device_io;
+
     if (!bus->devices) {
-        bus->devices = new_device;
+        bus->devices = mount;
         return;
     }
 
-    bus_device_t * device = bus->devices;
-    while (device->next) {
-        device = device->next;
+    bus_device_t * cur = bus->devices;
+    while (cur->next) {
+        cur = cur->next;
     }
-    device->next = new_device;
+    cur->next = mount;
 }
 
-void bus_operate(bus_t * bus, uint8_t is_write, uint16_t address, uint8_t * data) {
-    bus_device_t * device = bus->devices;
-    while (device) {
-        if (device->address_start <= address && address <= device->address_end) {
-            uint16_t offset = address - device->address_start;
-            if (is_write) {
-                device->memory[offset] = *data;
-            } else {
-                *data = device->memory[offset];
-            }
+void bus_io(bus_t * bus, uint16_t address, uint8_t * data, uint8_t is_write) {
+    bus_device_t * mount = bus->devices;
+    while (mount) {
+        if (mount->start <= address && address <= mount->end && mount->device && mount->device_io) {
+            uint16_t offset = address - mount->start;
+            mount->device_io(mount->device, offset, data, is_write);
             break;
         }
 
-        device = device->next;
+        mount = mount->next;
     }
 }
 
 uint8_t bus_read(bus_t * bus, uint16_t address) 
 {
     uint8_t ret = 0;
-    bus_operate(bus, 0, address, &ret);
+    bus_io(bus, address, &ret, 0);
     return ret;
 }
 
@@ -122,10 +135,8 @@ uint8_t bus_read2(bus_t * bus, uint16_t address)
 
 void bus_write(bus_t * bus, uint16_t address, uint8_t data) 
 {
-    bus_operate(bus, 1, address, &data);
+    bus_io(bus, address, &data, 1);
 }
-
-
 
 
 int load_rom(char * path, rom_t * rom) {
@@ -154,41 +165,66 @@ int load_rom(char * path, rom_t * rom) {
     printf("prg rom size:%d\n", header.prg_units);
     printf("chr rom size:%d\n", header.chr_units);
     printf("mirroring:%d\n", header.flags_6 & 0x1);
-    printf("contains battery-backed prg ram:%d\n", take_bit(header.flags_6, 2));
-    printf("has trainer at $7000-$71ff:%d\n", take_bit(header.flags_6,3));
-    printf("ignore mirroring control:%d\n", take_bit(header.flags_6,4));
+    printf("contains battery-backed prg ram:%d\n", bit_get(header.flags_6, 2));
+    printf("has trainer at $7000-$71ff:%d\n", bit_get(header.flags_6,3));
+    printf("ignore mirroring control:%d\n", bit_get(header.flags_6,4));
     printf("mapper number:%d\n", header.flags_6 >> 4);
 
-    printf("vs unisystem:%d\n", take_bit(header.flags_7, 0));
-    printf("play choice - 10:%d\n", take_bit(header.flags_7, 1));
-    printf("nes version:%d\n", (take_bit(header.flags_7, 4)<<1) | take_bit(header.flags_7, 3));
+    printf("vs unisystem:%d\n", bit_get(header.flags_7, 0));
+    printf("play choice - 10:%d\n", bit_get(header.flags_7, 1));
+    printf("nes version:%d\n", (bit_get(header.flags_7, 4)<<1) | bit_get(header.flags_7, 3));
     printf("mapper number:%d\n", header.flags_7 >> 4);
 
     printf("prg ram size:%d\n", header.flags_8 );
     printf("tv system:%s\n", header.flags_9 & 1? "pal":"ntsc");
     printf("tv system:%s\n", header.flags_10 & 3 == 0? "pal":"ntsc");
+    rom->header = header;
+    rom->prg_rom = (uint8_t*)malloc(header.prg_units * 16 * 1024);
+    rom->chr_rom = (uint8_t*)malloc(header.chr_units * 8 * 1024);
     fclose(fp);
+    return 1;
 }
 
 
-void cpu_bootup(cpu_t * cpu) 
+void cpu_power_up(cpu_t * cpu) 
 {
+    memset(cpu, 0, sizeof(cpu_t));
+    cpu->ram = (uint8_t*)malloc(0x800);
+
+    bus_mount(&cpu->bus, cpu->ram, 0x0000, 0x07ff, memory_io);
+    bus_mount(&cpu->bus, cpu->ram, 0x0800, 0x0fff, memory_io);
+    bus_mount(&cpu->bus, cpu->ram, 0x1000, 0x17ff, memory_io);
+    bus_mount(&cpu->bus, cpu->ram, 0x1800, 0x1fff, memory_io);
+
     cpu->P = 0x34;
     cpu->A = 0;
     cpu->X = 0;
     cpu->Y = 0;
     cpu->SP = 0xFD;
 
-    for (int i =0 ;i < 0xf; ++ i) {
-        bus_write(&cpu->bus, 0x4000 + i, 0);
+    for (int i =0x4000 ;i <= 0x4013; ++ i) {
+        bus_write(&cpu->bus, i, 0);
     }
-    bus_write(&cpu->bus, 0x4015, 0);
-    bus_write(&cpu->bus, 0x4017, 0);
 }
 
-void bootup(nes_t * nes)
+void cpu_reset(cpu_t * cpu) 
 {
-    cpu_bootup(&nes->cpu);
+    cpu->SP -= 3;
+    bit_set(&cpu->P, I);
+}
+
+void cpu_interupt(cpu_t * cpu, cpu_int_t i)
+{
+}
+
+void nes_power_up(nes_t * nes)
+{
+    cpu_power_up(&nes->cpu);
+}
+
+void nes_set_rom(nes_t * nes, rom_t * rom)
+{
+    bus_mount(&nes->cpu.bus, rom->prg_rom, 0x8000, 0xffff, memory_io);
 }
 
 int main(int argc, char * argv[]) 
@@ -206,6 +242,7 @@ int main(int argc, char * argv[])
     }
 
     nes_t nes;
-    bootup(&nes);
+    nes_power_up(&nes);
+    nes_set_rom(&nes,&rom);
     return 0;
 }
