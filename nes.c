@@ -139,7 +139,9 @@ typedef struct {
     bus_t * bus;
     uint8_t * ram;
     uint8_t inst;
-    uint8_t data;
+    uint16_t abs;
+    uint16_t rel;
+    uint8_t operand;
 }cpu_t;
 
 typedef struct {
@@ -429,6 +431,23 @@ uint8_t cpu_fetch_inst(cpu_t * cpu)
         uint16_t ptr = cpu_fetch2(cpu);
         cpu->data = bus_read(cpu->bus, ptr);
         printf("$%04x", ptr);
+    }else if (inst->am == ABX) {
+        uint16_t ptr = cpu_fetch2(cpu);
+        cpu->data = bus_read(cpu->bus, ptr+cpu->x);
+        printf("$%04x,X[%x]", ptr, cpu->x);
+    }else if (inst->am == ABY) {
+        uint16_t ptr = cpu_fetch2(cpu);
+        cpu->data = bus_read(cpu->bus, ptr+cpu->y);
+        printf("$%04x,Y[%x]", ptr, cpu->y);
+    }else if (inst->am == IND) {
+        uint16_t ptr = cpu_fetch2(cpu);
+        uint16_t real_ptr = bus_read2(cpu->bus, ptr);
+        cpu->data = bus_read(cpu->bus, real_ptr);
+        printf("($%04x)", ptr);
+    }else if (inst->am == REL) {
+        uint16_t offset = cpu_fetch2(cpu);
+        cpu->data = bus_read(cpu->bus, cpu->pc - offset);
+        printf("pc-%x", offset);
     }
 
     printf("\n");
