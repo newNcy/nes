@@ -16,7 +16,12 @@ typedef struct {
 }rom_header_t;
 
 typedef struct {
-    rom_header_t header;
+    uint8_t prg_units;
+    uint8_t chr_units;
+    uint8_t mirroring;
+    uint8_t has_trainer;
+    uint8_t has_pram;
+    uint8_t mapper;
     uint8_t * trainer;
     uint8_t * prg_rom;
     uint8_t * chr_rom;
@@ -419,7 +424,7 @@ typedef struct {
     uint16_t pc;
     uint8_t s;
     uint8_t p;
-    uint8_t cycles;
+    uint16_t cycles;
     bus_t * bus;
     uint8_t * ram;
     uint8_t inst;
@@ -515,12 +520,29 @@ typedef struct {
     bus_t * bus;
     uint8_t * ram;
     uint8_t * oam;
+    uint16_t cycles;
 }ppu_t;
+
+
+typedef struct {
+    device_io_t cpu_io;
+    device_io_t ppu_io;
+}mapper_t;
 
 typedef struct {
     cpu_t * cpu;
     ppu_t * ppu;
 }nes_t;
+
+uint8_t calc_color(color_t c)
+{
+    return 16 + (36 * (c.r / 51)) + (6 * (c.g / 51)) + (c.b / 51);    
+}
+
+void show_block(uint8_t code)
+{
+    printf("\e[48;5;%dm  \e[0m", code);
+}
 
 int bit_get(uint8_t * byte, uint8_t bit) {
     return ((*byte)>>bit)&1;
@@ -669,7 +691,12 @@ int load_rom(char * path, rom_t * rom) {
     printf("prg ram size:%d\n", header.flags_8 );
     printf("tv system:%s\n", header.flags_9 & 1? "pal":"ntsc");
     printf("tv system:%s\n", (header.flags_10 & 3) == 0? "pal":"ntsc");
-    rom->header = header;
+
+    rom->mirroring = bit_get(&header.flags_6, 0);
+    rom->has_pram = bit_get(&header.flags_6, 1);
+    rom->has_trainer = bit_get(&header.flags_6, 2);
+
+    rom->mapper = (header.flags_6 >> 4) & 0xf;
     uint16_t prg_size = header.prg_units * 16 * 1024;
     uint16_t chr_size = header.chr_units * 8 * 1024;
     rom->prg_rom = (uint8_t*)malloc(prg_size);
@@ -960,20 +987,70 @@ void ppu_power_up(ppu_t * ppu)
     bit_set(&ppu->ppu_status, 7);
 }
 
-void ppu_show(ppu_t * ppu)
+void ppu_show_pattern_table(ppu_t * ppu, uint8_t id)
 {
-    uint8_t pattern[128*128][2] = {0};
-    for (int i = 0 ; i < 16; ++ i) {
-        for (int j = 0; j < 16; ++ j) {
-            
+    uint8_t pattern[128*128] = {0};
+
+    for (uint16_t ty = 0 ; ty < 16; ++ ty) {
+        for (uint16_t tx = 0; tx < 16; ++ tx) {
+            uint16_t tile_start = id * 0x1000 + ty * 16 * 16 + tx * 16;
+
+            for (uint16_t row = 0; row < 8; row ++)  {
+                uint8_t byte = bus_read(ppu->bus, tile_start + row);
+                uint8_t byte2 = bus_read(ppu->bus, tile_start + row + 8);
+                for (uint16_t col = 0; col < 8; col ++)  {
+                    uint8_t out = bit_get(&byte, 7-col) + bit_get(&byte2, 7-col);
+                    pattern[(ty * 8+row)*128 + tx*8 + col] = out;
+                }
+            }
         }
     }
+
+    for (uint16_t y = 0; y < 128; ++ y) {
+        for (uint16_t x = 0; x < 128; ++ x) {
+            uint8_t v = pattern[y*128+x];
+            show_block(v);
+            //printf("%d%d", v,v);
+        }
+        printf("\n");
+    }
+}
+
+void ppu_register_io(void * device, uint16_t address, uint8_t * byte, uint8_t is_write) 
+{
+    ppu_t * ppu = (ppu_t*)device;
+    switch(address) {
+        case 0:
+            break;
+        case 2:
+            *byte = 0xff;
+            break;
+    }
+}
+
+void ppu_oam_register_io(void * device, uint16_t address, uint8_t * byte, uint8_t is_write) 
+{
+    ppu_t * ppu = (ppu_t*)device;
 }
 
 void ppu_clock(ppu_t * ppu)
 {
 
 }
+
+void mapper_0_cpu_io(void * device, uint16_t address, uint8_t * data, uint8_t is_write)
+{
+    rom_t * rom = (rom_t*)device;
+    address -= 0x8000 - 0x4020;
+    memory_io(rom->prg_rom, address & 0x3fff, data, is_write);
+}
+
+void mapper_0_ppu_io(void * device, uint16_t address, uint8_t * data, uint8_t is_write)
+{
+    rom_t * rom = (rom_t*)device;
+    memory_io(rom->chr_rom, address, data, is_write);
+}
+
 
 nes_t * nes_create()
 {
@@ -982,8 +1059,8 @@ nes_t * nes_create()
     nes->cpu = cpu_create();
     nes->ppu = ppu_create();
 
-    bus_mount(nes->cpu->bus, nes->ppu, 0x2000, 0x2007, memory_io);
-    bus_mount(nes->cpu->bus, &nes->ppu->oam_dma, 0x4014, 0x4014, memory_io);
+    bus_mount(nes->cpu->bus, nes->ppu, 0x2000, 0x2007, ppu_register_io);
+    bus_mount(nes->cpu->bus, nes->ppu, 0x4014, 0x4014, ppu_oam_register_io);
     return nes;
 }
 
@@ -995,15 +1072,18 @@ void nes_power_up(nes_t * nes)
 
 void nes_set_rom(nes_t * nes, rom_t * rom)
 {
-    if (rom->header.prg_units == 1) {
-        bus_mount(nes->cpu->bus, rom->prg_rom, 0x8000, 0xbfff, memory_io);
-        bus_mount(nes->cpu->bus, rom->prg_rom, 0xc000, 0xffff, memory_io);
-    }else {
-        bus_mount(nes->cpu->bus, rom->prg_rom, 0x8000, 0xffff, memory_io);
-    }
+    
+    mapper_t mappers[] = {
+        {mapper_0_cpu_io, mapper_0_ppu_io},
+    };
 
-    bus_mount(nes->ppu->bus, rom->chr_rom, 0x0000, 0x1fff, memory_io);
-    ppu_show(nes->ppu);
+    mapper_t * mapper = mappers + rom->mapper;
+    
+    bus_mount(nes->cpu->bus, rom, 0x4020, 0xffff, mapper->cpu_io);
+    bus_mount(nes->ppu->bus, rom, 0x0000, 0x1fff, mapper->ppu_io);
+    ppu_show_pattern_table(nes->ppu, 0);
+    printf("%\n");
+    ppu_show_pattern_table(nes->ppu, 1);
     cpu_interupt(nes->cpu, RESET);
 }
 
@@ -1015,15 +1095,7 @@ void nes_clock(nes_t * nes)
     ppu_clock(nes->ppu);
 }
 
-uint8_t calc_color(color_t c)
-{
-    return 16 + (36 * (c.r / 51)) + (6 * (c.g / 51)) + (c.b / 51);    
-}
 
-void show_color(uint8_t r, uint8_t g, uint8_t b)
-{
-    printf("\e[48;5;%dm   \e[0m", calc_color((color_t){r, g, b}));
-}
 
 int main(int argc, char * argv[]) 
 {
@@ -1039,21 +1111,32 @@ int main(int argc, char * argv[])
         printf("load rom failed\n");
 
     }
+    /*
 
     for (int i = 0 ; i < sizeof(system_palette) / sizeof(color_t); ++ i) {
         color_t c = system_palette[i];
         uint8_t code = calc_color(c);
         uint8_t white = calc_color((color_t){0xee, 0xee, 0xff});
-        printf("\e[48;5;%dm\e[38;5;%dm   \e[0m", code,white);
+        printf("\e[48;5;%dm\e[38;5;%dm  \e[0m", code,white);
         if ((i+1)%16 == 0) {
             printf("\n");
         }
     }
+
+        printf("\n");
+    for (int i = 0 ; i < 128; ++ i) {
+        for (int j = 0 ; j < 128; ++ j) {
+            printf("\e[48;5;%dm\e[38;5;%dm  \e[0m", (i*128+j)%0xff);
+        }
+        printf("\n");
+    }
+    */
     nes_t * nes = nes_create();
     nes_power_up(nes);
     nes_set_rom(nes,&rom);
-    for (int i = 0 ; i < 1; ++ i) {
+    for (int i = 0 ; i < 100; ++ i) {
         nes_clock(nes);
     }
+    fflush(stdout);
     return 0;
 }
