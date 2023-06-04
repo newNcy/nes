@@ -1,8 +1,10 @@
 #include "nes.h"
+#include <stdatomic.h>
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <wctype.h>
 
 typedef struct {
     uint8_t prg_units;
@@ -508,6 +510,22 @@ static color_t system_palette[] = {
     {0x00, 0x00, 0x00}
 };
 
+typedef enum {
+    SPRITE_OVERFLOW = 5, SPRITE_0_HINT, V_BLANK,
+}ppu_status_bit_t;
+
+typedef enum {
+    ADDR_INC,
+}ppu_control_bit_t;
+
+typedef struct 
+{
+    uint8_t y;
+    uint8_t id;
+    uint8_t attribute;
+    uint8_t x;
+}object_attribute_t;
+
 typedef struct {
     uint8_t ppu_ctrl;
     uint8_t ppu_mask;
@@ -518,9 +536,14 @@ typedef struct {
     uint8_t ppu_data;
     uint8_t oam_dma;
     bus_t * bus;
-    uint8_t * ram;
-    uint8_t * oam;
+    uint8_t * name_tables;
+    uint8_t * paletters;
+    object_attribute_t oam[64];
     uint16_t cycles;
+    int16_t scanline;
+    uint8_t address_latch;
+    uint16_t ppu_data_address;
+    uint8_t ppu_data_buffer;
 }ppu_t;
 
 
@@ -541,7 +564,7 @@ uint8_t calc_color(color_t c)
 
 void show_block(uint8_t code)
 {
-    printf("\e[48;5;%dm  \e[0m", code);
+    printf("\e[48;5;%dm \e[0m", code);
 }
 
 int bit_get(uint8_t * byte, uint8_t bit) {
@@ -810,12 +833,12 @@ uint8_t cpu_fetch_inst(cpu_t * cpu)
         uint8_t zp = cpu_fetch(cpu);
         cpu->abs = zp;
         cpu->operand = bus_read(cpu->bus, zp);
-        printf("$%02x", zp);
+        printf("$%02x %x", zp, cpu->operand);
     }else if (inst->am == ZPX) {
         uint8_t zp = cpu_fetch(cpu);
         cpu->abs = zp + cpu->x;
         cpu->operand = bus_read(cpu->bus, zp+cpu->x);
-        printf("$%02x,X[%x]", zp, cpu->x);
+        printf("$%02x,X[%x] %x", zp, cpu->x, cpu->operand);
     }else if (inst->am == ZPY) {
         uint8_t zp = cpu_fetch(cpu);
         cpu->abs = zp + cpu->y;
@@ -969,12 +992,14 @@ ppu_t * ppu_create()
 {
     ppu_t * ppu = (ppu_t*)malloc(sizeof(ppu_t));
     memset(ppu, 0, sizeof(ppu_t));
-    ppu->ram = (uint8_t*)malloc(16 * 1024);
-    ppu->oam = (uint8_t*)malloc(256);
+    ppu->name_tables = (uint8_t*)malloc(0x3000 - 0x2000);
+    ppu->name_tables = (uint8_t*)malloc(0x3f20 - 0x3f00);
     ppu->bus = bus_create();
 
-    bus_mount(ppu->bus, ppu->ram, 0x2000, 0x2fff, memory_io);
-    bus_mount(ppu->bus, ppu->ram, 0x3000, 0x3eff, memory_io);
+    bus_mount(ppu->bus, ppu->name_tables, 0x2000, 0x2fff, memory_io);
+    bus_mount(ppu->bus, ppu->name_tables, 0x3000, 0x3eff, memory_io);
+
+    bus_mount(ppu->bus, ppu->paletters, 0x3f00, 0x3f1f, memory_io);
 
     return ppu;
 }
@@ -982,9 +1007,9 @@ ppu_t * ppu_create()
 
 void ppu_power_up(ppu_t * ppu)
 {
-    bit_set(&ppu->ppu_status, 5);
-    bit_clr(&ppu->ppu_status, 6);
-    bit_set(&ppu->ppu_status, 7);
+    bit_set(&ppu->ppu_status, SPRITE_OVERFLOW);
+    bit_clr(&ppu->ppu_status, SPRITE_0_HINT);
+    bit_set(&ppu->ppu_status, V_BLANK);
 }
 
 void ppu_show_pattern_table(ppu_t * ppu, uint8_t id)
@@ -1009,11 +1034,15 @@ void ppu_show_pattern_table(ppu_t * ppu, uint8_t id)
     for (uint16_t y = 0; y < 128; ++ y) {
         for (uint16_t x = 0; x < 128; ++ x) {
             uint8_t v = pattern[y*128+x];
-            show_block(v);
-            //printf("%d%d", v,v);
+            //show_block(v);
+            printf("%d", v);
         }
         printf("\n");
     }
+}
+
+void ppu_show_nametable()
+{
 }
 
 void ppu_register_io(void * device, uint16_t address, uint8_t * byte, uint8_t is_write) 
@@ -1023,7 +1052,41 @@ void ppu_register_io(void * device, uint16_t address, uint8_t * byte, uint8_t is
         case 0:
             break;
         case 2:
-            *byte = 0xff;
+            if (!is_write) {
+                bit_set(&ppu->ppu_status, V_BLANK);
+                *byte = (ppu->ppu_status & 0xe0) | (ppu->ppu_data_buffer & 0x1f);
+                bit_clr(&ppu->ppu_status, V_BLANK);
+            }
+            break;
+        case 3:
+            if (is_write) {
+            }
+            break;
+        case 4:
+            if (!is_write) {
+                *byte = ((uint8_t*)(ppu->oam))[ppu->oam_addr];
+            }
+            break;
+        case 6:
+            if (is_write) {
+                if (ppu->address_latch == 0) {
+                    ppu->ppu_data_address = (ppu->ppu_data_address & 0x00ff) |8 <<*byte;
+                    ppu->address_latch = 1;
+                }else {
+                    ppu->ppu_data_address = (ppu->ppu_data_address & 0xff00) | *byte;
+                    ppu->address_latch = 0;
+                }
+            }
+            break;
+        case 7:
+            if (is_write) {
+                bus_write(ppu->bus, ppu->ppu_data_address, *byte);
+                ppu->ppu_data_address ++;
+            }else {
+                *byte = ppu->ppu_data_buffer;
+                ppu->ppu_data_buffer = bus_read(ppu->bus, ppu->ppu_data_address);
+                ppu->ppu_data_address ++ ;
+            }
             break;
     }
 }
@@ -1036,6 +1099,12 @@ void ppu_oam_register_io(void * device, uint16_t address, uint8_t * byte, uint8_
 void ppu_clock(ppu_t * ppu)
 {
 
+    if (ppu->scanline == -1 && ppu->cycles == 1) {
+        bit_clr(&ppu->ppu_status, V_BLANK);
+    }
+    if (ppu->scanline == 241 && ppu->cycles == 1) {
+        bit_set(&ppu->ppu_status, V_BLANK);
+    }
 }
 
 void mapper_0_cpu_io(void * device, uint16_t address, uint8_t * data, uint8_t is_write)
