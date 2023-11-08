@@ -4,6 +4,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+
+#include <SDL3/SDL.h>
+
 typedef struct {
     uint8_t prg_units;
     uint8_t chr_units;
@@ -874,5 +877,11 @@ int main(int argc, char * argv[])
     for (int i = 0 ; i < 1000; ++ i) {
         nes_clock(nes);
     }
+
+
+
+	SDL_Init(SDL_INIT_EVERYTHING);
+    SDL_Window * window = SDL_CreateWindow("nes", 300, 300, 0);
+	SDL_Quit();
     return 0;
 }
