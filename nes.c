@@ -1,8 +1,10 @@
 #include "nes.h"
+#include <stdatomic.h>
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <wctype.h>
 
 
 #include <SDL3/SDL.h>
@@ -19,7 +21,12 @@ typedef struct {
 }rom_header_t;
 
 typedef struct {
-    rom_header_t header;
+    uint8_t prg_units;
+    uint8_t chr_units;
+    uint8_t mirroring;
+    uint8_t has_trainer;
+    uint8_t has_pram;
+    uint8_t mapper;
     uint8_t * trainer;
     uint8_t * prg_rom;
     uint8_t * chr_rom;
@@ -422,7 +429,7 @@ typedef struct {
     uint16_t pc;
     uint8_t s;
     uint8_t p;
-    uint8_t cycles;
+    uint16_t cycles;
     bus_t * bus;
     uint8_t * ram;
     uint8_t inst;
@@ -430,6 +437,97 @@ typedef struct {
     int8_t rel;
     uint8_t operand;
 }cpu_t;
+
+
+typedef struct {
+    uint8_t r;
+    uint8_t g;
+    uint8_t b;
+}color_t;
+
+static color_t system_palette[] = {
+    {0x75, 0x75, 0x75},
+    {0x27, 0x1B, 0x8F},
+    {0x00, 0x00, 0xAB},
+    {0x47, 0x00, 0x9F},
+    {0x8F, 0x00, 0x77},
+    {0xAB, 0x00, 0x13},
+    {0xA7, 0x00, 0x00},
+    {0x7F, 0x0B, 0x00},
+    {0x43, 0x2F, 0x00},
+    {0x00, 0x47, 0x00},
+    {0x00, 0x51, 0x00},
+    {0x00, 0x3F, 0x17},
+    {0x1B, 0x3F, 0x5F},
+    {0x00, 0x00, 0x00},
+    {0x00, 0x00, 0x00},
+    {0x00, 0x00, 0x00},
+    {0xBC, 0xBC, 0xBC},
+    {0x00, 0x73, 0xEF},
+    {0x23, 0x3B, 0xEF},
+    {0x83, 0x00, 0xF3},
+    {0xBF, 0x00, 0xBF},
+    {0xE7, 0x00, 0x5B},
+    {0xDB, 0x2B, 0x00},
+    {0xCB, 0x4F, 0x0F},
+    {0x8B, 0x73, 0x00},
+    {0x00, 0x97, 0x00},
+    {0x00, 0xAB, 0x00},
+    {0x00, 0x93, 0x3B},
+    {0x00, 0x83, 0x8B},
+    {0x00, 0x00, 0x00},
+    {0x00, 0x00, 0x00},
+    {0x00, 0x00, 0x00},
+    {0xFF, 0xFF, 0xFF},
+    {0x3F, 0xBF, 0xFF},
+    {0x5F, 0x97, 0xFF},
+    {0xA7, 0x8B, 0xFD},
+    {0xF7, 0x7B, 0xFF},
+    {0xFF, 0x77, 0xB7},
+    {0xFF, 0x77, 0x63},
+    {0xFF, 0x9B, 0x3B},
+    {0xF3, 0xBF, 0x3F},
+    {0x83, 0xD3, 0x13},
+    {0x4F, 0xDF, 0x4B},
+    {0x58, 0xF8, 0x98},
+    {0x00, 0xEB, 0xDB},
+    {0x00, 0x00, 0x00},
+    {0x00, 0x00, 0x00},
+    {0x00, 0x00, 0x00},
+    {0xFF, 0xFF, 0xFF},
+    {0xAB, 0xE7, 0xFF},
+    {0xC7, 0xD7, 0xFF},
+    {0xD7, 0xCB, 0xFF},
+    {0xFF, 0xC7, 0xFF},
+    {0xFF, 0xC7, 0xDB},
+    {0xFF, 0xBF, 0xB3},
+    {0xFF, 0xDB, 0xAB},
+    {0xFF, 0xE7, 0xA3},
+    {0xE3, 0xFF, 0xA3},
+    {0xAB, 0xF3, 0xBF},
+    {0xB3, 0xFF, 0xCF},
+    {0x9F, 0xFF, 0xF3},
+    {0x00, 0x00, 0x00},
+    {0x00, 0x00, 0x00},
+    {0x00, 0x00, 0x00},
+    {0x00, 0x00, 0x00}
+};
+
+typedef enum {
+    SPRITE_OVERFLOW = 5, SPRITE_0_HINT, V_BLANK,
+}ppu_status_bit_t;
+
+typedef enum {
+    ADDR_INC,
+}ppu_control_bit_t;
+
+typedef struct 
+{
+    uint8_t y;
+    uint8_t id;
+    uint8_t attribute;
+    uint8_t x;
+}object_attribute_t;
 
 typedef struct {
     uint8_t ppu_ctrl;
@@ -439,13 +537,38 @@ typedef struct {
     uint8_t ppu_scroll;
     uint8_t ppu_addr;
     uint8_t ppu_data;
-    uint8_t oamdma;
+    uint8_t oam_dma;
+    bus_t * bus;
+    uint8_t * name_tables;
+    uint8_t * paletters;
+    object_attribute_t oam[64];
+    uint16_t cycles;
+    int16_t scanline;
+    uint8_t address_latch;
+    uint16_t ppu_data_address;
+    uint8_t ppu_data_buffer;
 }ppu_t;
+
+
+typedef struct {
+    device_io_t cpu_io;
+    device_io_t ppu_io;
+}mapper_t;
 
 typedef struct {
     cpu_t * cpu;
     ppu_t * ppu;
 }nes_t;
+
+uint8_t calc_color(color_t c)
+{
+    return 16 + (36 * (c.r / 51)) + (6 * (c.g / 51)) + (c.b / 51);    
+}
+
+void show_block(uint8_t code)
+{
+    printf("\e[48;5;%dm \e[0m", code);
+}
 
 int bit_get(uint8_t * byte, uint8_t bit) {
     return ((*byte)>>bit)&1;
@@ -458,8 +581,13 @@ void bit_set(uint8_t * byte, uint8_t bit)
 
 void bit_clr(uint8_t * byte, uint8_t bit)
 {
-
     *byte &= ~(1<<bit);
+}
+
+void bit_setv(uint8_t * byte, uint8_t bit, uint8_t v)
+{
+    if (v) bit_set(byte, bit);
+    else bit_clr(byte, bit);
 }
 
 void memory_io(void * memory, uint16_t offset, uint8_t * data, uint8_t is_write)
@@ -588,8 +716,13 @@ int load_rom(char * path, rom_t * rom) {
 
     printf("prg ram size:%d\n", header.flags_8 );
     printf("tv system:%s\n", header.flags_9 & 1? "pal":"ntsc");
-    printf("tv system:%s\n", header.flags_10 & 3 == 0? "pal":"ntsc");
-    rom->header = header;
+    printf("tv system:%s\n", (header.flags_10 & 3) == 0? "pal":"ntsc");
+
+    rom->mirroring = bit_get(&header.flags_6, 0);
+    rom->has_pram = bit_get(&header.flags_6, 1);
+    rom->has_trainer = bit_get(&header.flags_6, 2);
+
+    rom->mapper = (header.flags_6 >> 4) & 0xf;
     uint16_t prg_size = header.prg_units * 16 * 1024;
     uint16_t chr_size = header.chr_units * 8 * 1024;
     rom->prg_rom = (uint8_t*)malloc(prg_size);
@@ -605,6 +738,12 @@ cpu_t * cpu_create()
     cpu_t * cpu = (cpu_t*)malloc(sizeof(cpu_t));
     cpu->ram = (uint8_t*)malloc(0x800);
     cpu->bus = bus_create();
+
+    bus_mount(cpu->bus, cpu->ram, 0x0000, 0x07ff, memory_io);
+    bus_mount(cpu->bus, cpu->ram, 0x0800, 0x0fff, memory_io);
+    bus_mount(cpu->bus, cpu->ram, 0x1000, 0x17ff, memory_io);
+    bus_mount(cpu->bus, cpu->ram, 0x1800, 0x1fff, memory_io);
+
     return cpu;
 }
 
@@ -617,13 +756,13 @@ void cpu_destroy(cpu_t * cpu)
 
 void cpu_stack_push(cpu_t * cpu, uint8_t byte)
 {
-    bus_write(cpu->bus, cpu->s, byte);
     cpu->s --;
+    bus_write(cpu->bus, cpu->s, byte);
 }
 void cpu_stack_push2(cpu_t * cpu, uint16_t byte)
 {
-    bus_write2(cpu->bus, cpu->s, byte);
     cpu->s -= 2;
+    bus_write2(cpu->bus, cpu->s, byte);
 }
 
 uint8_t cpu_stack_pop(cpu_t * cpu)
@@ -633,19 +772,13 @@ uint8_t cpu_stack_pop(cpu_t * cpu)
 
 uint16_t cpu_stack_pop2(cpu_t * cpu)
 {
-    uint16_t d = bus_read2(cpu->bus, cpu->s ++);
+    uint16_t d = bus_read2(cpu->bus, cpu->s);
     cpu->s += 2;
     return d;
 }
 /* https://www.nesdev.org/wiki/CPU_power_up_state */
 void cpu_power_up(cpu_t * cpu) 
 {
-
-    bus_mount(cpu->bus, cpu->ram, 0x0000, 0x07ff, memory_io);
-    bus_mount(cpu->bus, cpu->ram, 0x0800, 0x0fff, memory_io);
-    bus_mount(cpu->bus, cpu->ram, 0x1000, 0x17ff, memory_io);
-    bus_mount(cpu->bus, cpu->ram, 0x1800, 0x1fff, memory_io);
-
     cpu->p = 0x34;
     cpu->a = 0;
     cpu->x = 0;
@@ -694,7 +827,7 @@ uint8_t cpu_fetch_inst(cpu_t * cpu)
 
     inst_t * inst = inst_map + cpu->inst;
     cpu->cycles += inst->cycles;
-    printf("%02x %s ", cpu->inst, inst_tag[inst->t], inst->am, inst->cycles);
+    printf("[%02x %s] ", cpu->inst, inst_tag[inst->t], inst->am, inst->cycles);
     if (inst->am == IMP) {
     }else if (inst->am == IMM) {
         cpu->operand = cpu_fetch(cpu);
@@ -703,12 +836,12 @@ uint8_t cpu_fetch_inst(cpu_t * cpu)
         uint8_t zp = cpu_fetch(cpu);
         cpu->abs = zp;
         cpu->operand = bus_read(cpu->bus, zp);
-        printf("$%02x", zp);
+        printf("$%02x %x", zp, cpu->operand);
     }else if (inst->am == ZPX) {
         uint8_t zp = cpu_fetch(cpu);
         cpu->abs = zp + cpu->x;
         cpu->operand = bus_read(cpu->bus, zp+cpu->x);
-        printf("$%02x,X[%x]", zp, cpu->x);
+        printf("$%02x,X[%x] %x", zp, cpu->x, cpu->operand);
     }else if (inst->am == ZPY) {
         uint8_t zp = cpu_fetch(cpu);
         cpu->abs = zp + cpu->y;
@@ -717,11 +850,13 @@ uint8_t cpu_fetch_inst(cpu_t * cpu)
     }else if (inst->am == IZX) {
         uint8_t z = cpu_fetch(cpu);
         uint8_t ptr = bus_read(cpu->bus, z + cpu->x); 
+        cpu->abs = ptr;
         cpu->operand = bus_read(cpu->bus, ptr);
         printf("($%02x,X[%x])", z, cpu->x);
     }else if (inst->am == IZY) {
         uint8_t z = cpu_fetch(cpu);
         uint8_t ptr = bus_read(cpu->bus, z + cpu->y); 
+        cpu->abs = ptr;
         cpu->operand = bus_read(cpu->bus, ptr);
         printf("($%02x,Y[%x])", z, cpu->y);
     }else if (inst->am == ABS) {
@@ -731,15 +866,18 @@ uint8_t cpu_fetch_inst(cpu_t * cpu)
         printf("$%04x", ptr);
     }else if (inst->am == ABX) {
         uint16_t ptr = cpu_fetch2(cpu);
+        cpu->abs = ptr + cpu->x;
         cpu->operand = bus_read(cpu->bus, ptr+cpu->x);
         printf("$%04x,X[%x]", ptr, cpu->x);
     }else if (inst->am == ABY) {
         uint16_t ptr = cpu_fetch2(cpu);
+        cpu->abs = ptr + cpu->y;
         cpu->operand = bus_read(cpu->bus, ptr+cpu->y);
         printf("$%04x,Y[%x]", ptr, cpu->y);
     }else if (inst->am == IND) {
         uint16_t ptr = cpu_fetch2(cpu);
         uint16_t real_ptr = bus_read2(cpu->bus, ptr);
+        cpu->abs = real_ptr;
         cpu->operand = bus_read(cpu->bus, real_ptr);
         printf("($%04x)", ptr);
     }else if (inst->am == REL) {
@@ -754,15 +892,13 @@ uint8_t cpu_fetch_inst(cpu_t * cpu)
 
 uint8_t cpu_exec(cpu_t * cpu)
 {
-    printf("\n");
-    if (cpu->inst > sizeof(inst_map)/sizeof(inst_t)) {
-        return 0;
-    }
-
     inst_t * inst = inst_map + cpu->inst;
     switch(inst->t) {
         default:
-            printf("un supported instruction %x\n", cpu->inst);
+            printf(" unsupported");
+            break;
+        case BMI:
+            cpu->pc += cpu->rel * bit_get(&cpu->p, N);
             break;
         case JSR:
             cpu_stack_push2(cpu, cpu->pc);
@@ -776,13 +912,14 @@ uint8_t cpu_exec(cpu_t * cpu)
             break;
         case LDA:
             cpu->a = bus_read(cpu->bus, cpu->abs);
+            bit_setv(&cpu->p, N, cpu->a & 0x80);
+            bit_setv(&cpu->p, Z, !cpu->a);
             break;
         case BPL:
             cpu->pc = cpu->pc + cpu->rel * (bit_get(&cpu->p, N) == 0);
             break;
         case BRK:
             bit_clr(&cpu->p, I);
-            bit_set(&cpu->p, B);
             cpu_interupt(cpu, IRQ);
             break;
         case RTI:
@@ -795,7 +932,43 @@ uint8_t cpu_exec(cpu_t * cpu)
         case STA:
             bus_write(cpu->bus, cpu->abs, cpu->a);
             break;
+        case SEI:
+            bit_set(&cpu->p, I);
+            break;
+        case LDX:
+            cpu->x = cpu->operand;
+            bit_setv(&cpu->p, Z, !cpu->x);
+            bit_setv(&cpu->p, N, 0x8 & cpu->x);
+            break;
+        case TXS:
+            cpu->s = cpu->x;
+            break;
+        case TXA:
+            cpu->a = cpu->x;
+            break;
+        case CMP:
+            bit_setv(&cpu->p, C, cpu->a >= cpu->operand);
+            bit_setv(&cpu->p, Z, cpu->a == cpu->operand);
+            bit_setv(&cpu->p, N, (cpu->a - cpu->operand) & 0x80);
+            break;
+        case BNE:
+            cpu->pc = cpu->pc + cpu->rel * (bit_get(&cpu->p, Z) == 0);
+            break;
+        case STX:
+            bus_write(cpu->bus, cpu->abs, cpu->x);
+            break;
+        case LDY:
+            cpu->y = cpu->operand;
+            bit_setv(&cpu->p, Z, !cpu->y);
+            bit_setv(&cpu->p, N, 0x80 & cpu->y);
+            break;
+        case DEY:
+            cpu->y --;
+            bit_setv(&cpu->p, Z, !cpu->y);
+            bit_setv(&cpu->p, N, 0x80 & cpu->y);
+            break;
     }
+    printf("\n");
     return 0;
 }
 
@@ -803,7 +976,7 @@ void cpu_clock(cpu_t * cpu)
 {
     if (cpu->cycles == 0) {
 
-        printf("pc:$%04x a:%x x:%x y:%x N:%d V:%d B:%d D:%d I:%d Z:%d C:%d ", cpu->pc, cpu->a, cpu->x, cpu->y, 
+        printf("[%02x:%02x:%02x] [%d:%d:%d:%d:%d:%d:%d] ", cpu->a, cpu->x, cpu->y, 
             bit_get(&cpu->p, N),
             bit_get(&cpu->p, V),
             bit_get(&cpu->p, B),
@@ -822,9 +995,134 @@ ppu_t * ppu_create()
 {
     ppu_t * ppu = (ppu_t*)malloc(sizeof(ppu_t));
     memset(ppu, 0, sizeof(ppu_t));
+    ppu->name_tables = (uint8_t*)malloc(0x3000 - 0x2000);
+    ppu->name_tables = (uint8_t*)malloc(0x3f20 - 0x3f00);
+    ppu->bus = bus_create();
+
+    bus_mount(ppu->bus, ppu->name_tables, 0x2000, 0x2fff, memory_io);
+    bus_mount(ppu->bus, ppu->name_tables, 0x3000, 0x3eff, memory_io);
+
+    bus_mount(ppu->bus, ppu->paletters, 0x3f00, 0x3f1f, memory_io);
 
     return ppu;
 }
+
+
+void ppu_power_up(ppu_t * ppu)
+{
+    bit_set(&ppu->ppu_status, SPRITE_OVERFLOW);
+    bit_clr(&ppu->ppu_status, SPRITE_0_HINT);
+    bit_set(&ppu->ppu_status, V_BLANK);
+}
+
+void ppu_show_pattern_table(ppu_t * ppu, uint8_t id)
+{
+    uint8_t pattern[128*128] = {0};
+
+    for (uint16_t ty = 0 ; ty < 16; ++ ty) {
+        for (uint16_t tx = 0; tx < 16; ++ tx) {
+            uint16_t tile_start = id * 0x1000 + ty * 16 * 16 + tx * 16;
+
+            for (uint16_t row = 0; row < 8; row ++)  {
+                uint8_t byte = bus_read(ppu->bus, tile_start + row);
+                uint8_t byte2 = bus_read(ppu->bus, tile_start + row + 8);
+                for (uint16_t col = 0; col < 8; col ++)  {
+                    uint8_t out = bit_get(&byte, 7-col) + bit_get(&byte2, 7-col);
+                    pattern[(ty * 8+row)*128 + tx*8 + col] = out;
+                }
+            }
+        }
+    }
+
+    for (uint16_t y = 0; y < 128; ++ y) {
+        for (uint16_t x = 0; x < 128; ++ x) {
+            uint8_t v = pattern[y*128+x];
+            //show_block(v);
+            printf("%d", v);
+        }
+        printf("\n");
+    }
+}
+
+void ppu_show_nametable()
+{
+}
+
+void ppu_register_io(void * device, uint16_t address, uint8_t * byte, uint8_t is_write) 
+{
+    ppu_t * ppu = (ppu_t*)device;
+    switch(address) {
+        case 0:
+            break;
+        case 2:
+            if (!is_write) {
+                bit_set(&ppu->ppu_status, V_BLANK);
+                *byte = (ppu->ppu_status & 0xe0) | (ppu->ppu_data_buffer & 0x1f);
+                bit_clr(&ppu->ppu_status, V_BLANK);
+            }
+            break;
+        case 3:
+            if (is_write) {
+            }
+            break;
+        case 4:
+            if (!is_write) {
+                *byte = ((uint8_t*)(ppu->oam))[ppu->oam_addr];
+            }
+            break;
+        case 6:
+            if (is_write) {
+                if (ppu->address_latch == 0) {
+                    ppu->ppu_data_address = (ppu->ppu_data_address & 0x00ff) |8 <<*byte;
+                    ppu->address_latch = 1;
+                }else {
+                    ppu->ppu_data_address = (ppu->ppu_data_address & 0xff00) | *byte;
+                    ppu->address_latch = 0;
+                }
+            }
+            break;
+        case 7:
+            if (is_write) {
+                bus_write(ppu->bus, ppu->ppu_data_address, *byte);
+                ppu->ppu_data_address ++;
+            }else {
+                *byte = ppu->ppu_data_buffer;
+                ppu->ppu_data_buffer = bus_read(ppu->bus, ppu->ppu_data_address);
+                ppu->ppu_data_address ++ ;
+            }
+            break;
+    }
+}
+
+void ppu_oam_register_io(void * device, uint16_t address, uint8_t * byte, uint8_t is_write) 
+{
+    ppu_t * ppu = (ppu_t*)device;
+}
+
+void ppu_clock(ppu_t * ppu)
+{
+
+    if (ppu->scanline == -1 && ppu->cycles == 1) {
+        bit_clr(&ppu->ppu_status, V_BLANK);
+    }
+    if (ppu->scanline == 241 && ppu->cycles == 1) {
+        bit_set(&ppu->ppu_status, V_BLANK);
+    }
+}
+
+void mapper_0_cpu_io(void * device, uint16_t address, uint8_t * data, uint8_t is_write)
+{
+    rom_t * rom = (rom_t*)device;
+    address -= 0x8000 - 0x4020;
+    memory_io(rom->prg_rom, address & 0x3fff, data, is_write);
+}
+
+void mapper_0_ppu_io(void * device, uint16_t address, uint8_t * data, uint8_t is_write)
+{
+    rom_t * rom = (rom_t*)device;
+    memory_io(rom->chr_rom, address, data, is_write);
+}
+
 
 nes_t * nes_create()
 {
@@ -832,30 +1130,44 @@ nes_t * nes_create()
     memset(nes, 0, sizeof(nes_t));
     nes->cpu = cpu_create();
     nes->ppu = ppu_create();
+
+    bus_mount(nes->cpu->bus, nes->ppu, 0x2000, 0x2007, ppu_register_io);
+    bus_mount(nes->cpu->bus, nes->ppu, 0x4014, 0x4014, ppu_oam_register_io);
     return nes;
 }
 
 void nes_power_up(nes_t * nes)
 {
     cpu_power_up(nes->cpu);
+    ppu_power_up(nes->ppu);
 }
 
 void nes_set_rom(nes_t * nes, rom_t * rom)
 {
-    if (rom->header.prg_units == 1) {
-        bus_mount(nes->cpu->bus, rom->prg_rom, 0x8000, 0xbfff, memory_io);
-        bus_mount(nes->cpu->bus, rom->prg_rom, 0xc000, 0xffff, memory_io);
-    }else {
-        bus_mount(nes->cpu->bus, rom->prg_rom, 0x8000, 0xffff, memory_io);
-    }
+    
+    mapper_t mappers[] = {
+        {mapper_0_cpu_io, mapper_0_ppu_io},
+    };
 
+    mapper_t * mapper = mappers + rom->mapper;
+    
+    bus_mount(nes->cpu->bus, rom, 0x4020, 0xffff, mapper->cpu_io);
+    bus_mount(nes->ppu->bus, rom, 0x0000, 0x1fff, mapper->ppu_io);
+    ppu_show_pattern_table(nes->ppu, 0);
+    printf("%\n");
+    ppu_show_pattern_table(nes->ppu, 1);
     cpu_interupt(nes->cpu, RESET);
 }
 
 void nes_clock(nes_t * nes)
 {
     cpu_clock(nes->cpu);
+    ppu_clock(nes->ppu);
+    ppu_clock(nes->ppu);
+    ppu_clock(nes->ppu);
 }
+
+
 
 int main(int argc, char * argv[]) 
 {
@@ -869,12 +1181,32 @@ int main(int argc, char * argv[])
     rom_t rom;
     if (!load_rom(rom_path, &rom)) {
         printf("load rom failed\n");
+
+    }
+    /*
+
+    for (int i = 0 ; i < sizeof(system_palette) / sizeof(color_t); ++ i) {
+        color_t c = system_palette[i];
+        uint8_t code = calc_color(c);
+        uint8_t white = calc_color((color_t){0xee, 0xee, 0xff});
+        printf("\e[48;5;%dm\e[38;5;%dm  \e[0m", code,white);
+        if ((i+1)%16 == 0) {
+            printf("\n");
+        }
     }
 
+        printf("\n");
+    for (int i = 0 ; i < 128; ++ i) {
+        for (int j = 0 ; j < 128; ++ j) {
+            printf("\e[48;5;%dm\e[38;5;%dm  \e[0m", (i*128+j)%0xff);
+        }
+        printf("\n");
+    }
+    */
     nes_t * nes = nes_create();
     nes_power_up(nes);
     nes_set_rom(nes,&rom);
-    for (int i = 0 ; i < 1000; ++ i) {
+    for (int i = 0 ; i < 100; ++ i) {
         nes_clock(nes);
     }
 
