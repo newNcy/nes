@@ -4,10 +4,12 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <assert.h>
 #include <wctype.h>
 
 
-#include <SDL3/SDL.h>
+#include <SDL.h>
+#include <SDL_hints.h>
 
 typedef struct {
     uint8_t prg_units;
@@ -32,14 +34,18 @@ typedef struct {
     uint8_t * chr_rom;
 }rom_t;
 
-
 typedef void (*device_io_t)(void * device, uint16_t address, uint8_t * data, uint8_t is_write);
+
+typedef struct {
+    void * data;
+    device_io_t  io;
+}device_t;
+
 
 typedef struct bus_device_t {
     uint16_t start;
     uint16_t end;
-    void * device;
-    device_io_t device_io;
+    device_t * device;
     struct bus_device_t * next;
 }bus_device_t;
 
@@ -76,6 +82,7 @@ typedef struct {
     addressing_mode_t am;
     uint8_t cycles;
 }inst_t;
+
 
 /* chatgpt */
 static char * inst_tag[] = {
@@ -539,8 +546,10 @@ typedef struct {
     uint8_t ppu_data;
     uint8_t oam_dma;
     bus_t * bus;
-    uint8_t * name_tables;
-    uint8_t * paletters;
+    device_t * name_tables;
+    device_t * paletters;
+    device_t * registers;
+    device_t * oma_registers;
     object_attribute_t oam[64];
     uint16_t cycles;
     int16_t scanline;
@@ -558,6 +567,8 @@ typedef struct {
 typedef struct {
     cpu_t * cpu;
     ppu_t * ppu;
+    device_t * cpu_mapper;
+    device_t * ppu_mapper;
 }nes_t;
 
 uint8_t calc_color(color_t c)
@@ -618,14 +629,13 @@ void bus_destroy(bus_t * bus)
     free(bus);
 }
 
-void bus_mount(bus_t * bus, void * device, uint16_t start, uint16_t end, device_io_t device_io)
+void bus_mount(bus_t * bus, uint16_t start, uint16_t end, device_t * device)
 {
     bus_device_t * mount = (bus_device_t*)malloc(sizeof(bus_device_t));
     memset(mount, 0, sizeof(bus_device_t));
     mount->start = start;
     mount->end = end;
     mount->device = device;
-    mount->device_io = device_io;
 
     if (!bus->devices) {
         bus->devices = mount;
@@ -642,9 +652,9 @@ void bus_mount(bus_t * bus, void * device, uint16_t start, uint16_t end, device_
 void bus_io(bus_t * bus, uint16_t address, uint8_t * data, uint8_t is_write) {
     bus_device_t * mount = bus->devices;
     while (mount) {
-        if (mount->start <= address && address <= mount->end && mount->device && mount->device_io) {
+        if (mount->start <= address && address <= mount->end && mount->device) {
             uint16_t offset = address - mount->start;
-            mount->device_io(mount->device, offset, data, is_write);
+            mount->device->io(mount->device->data, offset, data, is_write);
             break;
         }
 
@@ -733,16 +743,45 @@ int load_rom(char * path, rom_t * rom) {
     return 1;
 }
 
+device_t * memory_device_create(int size)
+{
+    device_t * device = (device_t *) malloc(sizeof(device_t));
+    device->data = malloc(size);
+    device->io = memory_io;
+    return device;
+}
+
+void memory_device_destroy(device_t * device)
+{
+    free(device->data);
+    free(device);
+}
+
+device_t * device_create(void * data, device_io_t io)
+{
+    device_t * device = (device_t *) malloc(sizeof(device_t));
+    device->data = data;
+    device->io = io;
+    return device;
+}
+
+void device_destroy(device_t * device)
+{
+    free(device);
+}
+
+
 cpu_t * cpu_create()
 {
     cpu_t * cpu = (cpu_t*)malloc(sizeof(cpu_t));
     cpu->ram = (uint8_t*)malloc(0x800);
+    cpu->ram = memory_device_create(0x800);
     cpu->bus = bus_create();
 
-    bus_mount(cpu->bus, cpu->ram, 0x0000, 0x07ff, memory_io);
-    bus_mount(cpu->bus, cpu->ram, 0x0800, 0x0fff, memory_io);
-    bus_mount(cpu->bus, cpu->ram, 0x1000, 0x17ff, memory_io);
-    bus_mount(cpu->bus, cpu->ram, 0x1800, 0x1fff, memory_io);
+    bus_mount(cpu->bus, 0x0000, 0x07ff, cpu->ram);
+    bus_mount(cpu->bus, 0x0800, 0x0fff, cpu->ram);
+    bus_mount(cpu->bus, 0x1000, 0x17ff, cpu->ram);
+    bus_mount(cpu->bus, 0x1800, 0x1fff, cpu->ram);
 
     return cpu;
 }
@@ -750,7 +789,7 @@ cpu_t * cpu_create()
 void cpu_destroy(cpu_t * cpu)
 {
     bus_destroy(cpu->bus);
-    free(cpu->ram);
+    memory_device_destroy(cpu->ram);
     free(cpu);
 }
 
@@ -890,7 +929,7 @@ uint8_t cpu_fetch_inst(cpu_t * cpu)
     return 0;
 }
 
-uint8_t cpu_exec(cpu_t * cpu)
+uint8_t cpu_exec_single(cpu_t * cpu)
 {
     inst_t * inst = inst_map + cpu->inst;
     switch(inst->t) {
@@ -986,67 +1025,12 @@ void cpu_clock(cpu_t * cpu)
             bit_get(&cpu->p, C)
             );
         cpu->cycles += cpu_fetch_inst(cpu);
-        cpu->cycles += cpu_exec(cpu);
+        cpu->cycles += cpu_exec_single(cpu);
     }
     cpu->cycles --;
 }
 
-ppu_t * ppu_create()
-{
-    ppu_t * ppu = (ppu_t*)malloc(sizeof(ppu_t));
-    memset(ppu, 0, sizeof(ppu_t));
-    ppu->name_tables = (uint8_t*)malloc(0x3000 - 0x2000);
-    ppu->name_tables = (uint8_t*)malloc(0x3f20 - 0x3f00);
-    ppu->bus = bus_create();
 
-    bus_mount(ppu->bus, ppu->name_tables, 0x2000, 0x2fff, memory_io);
-    bus_mount(ppu->bus, ppu->name_tables, 0x3000, 0x3eff, memory_io);
-
-    bus_mount(ppu->bus, ppu->paletters, 0x3f00, 0x3f1f, memory_io);
-
-    return ppu;
-}
-
-
-void ppu_power_up(ppu_t * ppu)
-{
-    bit_set(&ppu->ppu_status, SPRITE_OVERFLOW);
-    bit_clr(&ppu->ppu_status, SPRITE_0_HINT);
-    bit_set(&ppu->ppu_status, V_BLANK);
-}
-
-void ppu_show_pattern_table(ppu_t * ppu, uint8_t id)
-{
-    uint8_t pattern[128*128] = {0};
-
-    for (uint16_t ty = 0 ; ty < 16; ++ ty) {
-        for (uint16_t tx = 0; tx < 16; ++ tx) {
-            uint16_t tile_start = id * 0x1000 + ty * 16 * 16 + tx * 16;
-
-            for (uint16_t row = 0; row < 8; row ++)  {
-                uint8_t byte = bus_read(ppu->bus, tile_start + row);
-                uint8_t byte2 = bus_read(ppu->bus, tile_start + row + 8);
-                for (uint16_t col = 0; col < 8; col ++)  {
-                    uint8_t out = bit_get(&byte, 7-col) + bit_get(&byte2, 7-col);
-                    pattern[(ty * 8+row)*128 + tx*8 + col] = out;
-                }
-            }
-        }
-    }
-
-    for (uint16_t y = 0; y < 128; ++ y) {
-        for (uint16_t x = 0; x < 128; ++ x) {
-            uint8_t v = pattern[y*128+x];
-            //show_block(v);
-            printf("%d", v);
-        }
-        printf("\n");
-    }
-}
-
-void ppu_show_nametable()
-{
-}
 
 void ppu_register_io(void * device, uint16_t address, uint8_t * byte, uint8_t is_write) 
 {
@@ -1099,9 +1083,87 @@ void ppu_oam_register_io(void * device, uint16_t address, uint8_t * byte, uint8_
     ppu_t * ppu = (ppu_t*)device;
 }
 
+
+ppu_t * ppu_create()
+{
+    ppu_t * ppu = (ppu_t*)malloc(sizeof(ppu_t));
+    memset(ppu, 0, sizeof(ppu_t));
+    ppu->bus = bus_create();
+
+    ppu->paletters = memory_device_create(0x3f20 - 0x3f00);
+    bus_mount(ppu->bus, 0x3f00, 0x3f1f, ppu->paletters);
+    bus_mount(ppu->bus, 0x3f20, 0x3fff, ppu->paletters);
+
+    ppu->registers = device_create(ppu, ppu_register_io);
+    ppu->oma_registers = device_create(ppu, ppu_oam_register_io);
+    return ppu;
+}
+
+void * ppu_destroy(ppu_t * ppu) 
+{
+    bus_destroy(ppu->bus);
+    memory_device_destroy(ppu->paletters);
+    device_destroy(ppu->registers);
+    device_destroy(ppu->oma_registers);
+    free(ppu);
+}
+
+
+void ppu_power_up(ppu_t * ppu)
+{
+    bit_set(&ppu->ppu_status, SPRITE_OVERFLOW);
+    bit_clr(&ppu->ppu_status, SPRITE_0_HINT);
+    bit_set(&ppu->ppu_status, V_BLANK);
+}
+
+void ppu_show_pattern_table(ppu_t * ppu, uint8_t id)
+{
+    SDL_Window * window = SDL_CreateWindow("pattern", 256, 256, 0);
+
+    SDL_Renderer * renderer = SDL_CreateRenderer(window, NULL, 0);
+    SDL_Texture * renderBuffer = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_XRGB8888, SDL_TEXTUREACCESS_STREAMING, 128, 128);
+    SDL_SetTextureScaleMode(renderBuffer, SDL_SCALEMODE_NEAREST);
+
+    
+    uint32_t color[] = {0xffffffff, 0xaaaaaaaa, 0x88888888, 0x0};
+    uint32_t pixels [128*128] = {0};
+    uint8_t pattern[128*128] = {0};
+
+    for (uint16_t ty = 0 ; ty < 16; ++ ty) {
+        for (uint16_t tx = 0; tx < 16; ++ tx) {
+            uint16_t tile_start = id * 0x1000 + ty * 16 * 16 + tx * 16;
+
+            for (uint16_t row = 0; row < 8; row ++)  {
+                uint8_t byte = bus_read(ppu->bus, tile_start + row);
+                uint8_t byte2 = bus_read(ppu->bus, tile_start + row + 8);
+                for (uint16_t col = 0; col < 8; col ++)  {
+                    uint8_t out = bit_get(&byte, 7-col) + bit_get(&byte2, 7-col);
+                    assert(out < 4);
+                    pixels[(ty * 8+row)*128 + (tx*8 + col)] = color[out];
+                    pattern[(ty * 8+row)*128 + tx*8 + col] = out;                 
+                }
+            }
+        }
+    }
+
+    for (int i = 0; i < 128; ++ i) {
+        for (int j = 0; j < 128; ++ j) {
+            printf("%d", pattern[i*128+j]);
+        }
+        printf("\n");
+    }
+    SDL_UpdateTexture(renderBuffer, NULL, pixels, 4*128);
+    SDL_RenderTexture(renderer, renderBuffer, NULL, NULL);
+    SDL_RenderPresent(renderer);
+    SDL_ShowWindow(window);
+}
+
+void ppu_show_nametable()
+{
+}
+
 void ppu_clock(ppu_t * ppu)
 {
-
     if (ppu->scanline == -1 && ppu->cycles == 1) {
         bit_clr(&ppu->ppu_status, V_BLANK);
     }
@@ -1124,16 +1186,28 @@ void mapper_0_ppu_io(void * device, uint16_t address, uint8_t * data, uint8_t is
 }
 
 
+
 nes_t * nes_create()
 {
     nes_t * nes = (nes_t*)malloc(sizeof(nes_t));
     memset(nes, 0, sizeof(nes_t));
-    nes->cpu = cpu_create();
-    nes->ppu = ppu_create();
+    cpu_t * cpu = cpu_create();
+    ppu_t * ppu = ppu_create();
 
-    bus_mount(nes->cpu->bus, nes->ppu, 0x2000, 0x2007, ppu_register_io);
-    bus_mount(nes->cpu->bus, nes->ppu, 0x4014, 0x4014, ppu_oam_register_io);
+    bus_mount(cpu->bus, 0x2000, 0x2007, ppu->registers);
+    bus_mount(cpu->bus, 0x4014, 0x4014, ppu->oma_registers);
+
+    nes->cpu = cpu;
+    nes->ppu = ppu;
     return nes;
+}
+
+void nes_destroy(nes_t * nes)
+{
+    cpu_destroy(nes->cpu);
+    ppu_destroy(nes->ppu);
+
+    free(nes);
 }
 
 void nes_power_up(nes_t * nes)
@@ -1144,15 +1218,22 @@ void nes_power_up(nes_t * nes)
 
 void nes_set_rom(nes_t * nes, rom_t * rom)
 {
-    
+    if (!nes->cpu_mapper) {
+        nes->cpu_mapper = device_create(NULL, NULL);
+    }
+    if (!nes->ppu_mapper) {
+        nes->ppu_mapper = device_create(NULL, NULL);
+    }
     mapper_t mappers[] = {
         {mapper_0_cpu_io, mapper_0_ppu_io},
     };
 
     mapper_t * mapper = mappers + rom->mapper;
-    
-    bus_mount(nes->cpu->bus, rom, 0x4020, 0xffff, mapper->cpu_io);
-    bus_mount(nes->ppu->bus, rom, 0x0000, 0x1fff, mapper->ppu_io);
+
+    nes->cpu_mapper = device_create(rom, mapper->cpu_io);
+    nes->ppu_mapper = device_create(rom, mapper->ppu_io);
+    bus_mount(nes->cpu->bus, 0x4020, 0xffff, nes->cpu_mapper);
+    bus_mount(nes->ppu->bus, 0x0000, 0x1fff, nes->ppu_mapper);
     ppu_show_pattern_table(nes->ppu, 0);
     printf("%\n");
     ppu_show_pattern_table(nes->ppu, 1);
@@ -1168,52 +1249,37 @@ void nes_clock(nes_t * nes)
 }
 
 
+/*
+ * https://austinmorlan.com/posts/nes_rendering_overview/
+ */
 
 int main(int argc, char * argv[]) 
 {
-    /*
-       if (argc < 2) {
-       printf("usage: %s rom\n", argv[0]);
-       return -1;
-       }
-       */
-    char * rom_path = "rom/aa.nes";
+	SDL_Init(SDL_INIT_VIDEO);
+
+    char * rom_path = "../rom/aa.nes";
     rom_t rom;
     if (!load_rom(rom_path, &rom)) {
         printf("load rom failed\n");
-
-    }
-    /*
-
-    for (int i = 0 ; i < sizeof(system_palette) / sizeof(color_t); ++ i) {
-        color_t c = system_palette[i];
-        uint8_t code = calc_color(c);
-        uint8_t white = calc_color((color_t){0xee, 0xee, 0xff});
-        printf("\e[48;5;%dm\e[38;5;%dm  \e[0m", code,white);
-        if ((i+1)%16 == 0) {
-            printf("\n");
-        }
     }
 
-        printf("\n");
-    for (int i = 0 ; i < 128; ++ i) {
-        for (int j = 0 ; j < 128; ++ j) {
-            printf("\e[48;5;%dm\e[38;5;%dm  \e[0m", (i*128+j)%0xff);
-        }
-        printf("\n");
-    }
-    */
     nes_t * nes = nes_create();
     nes_power_up(nes);
     nes_set_rom(nes,&rom);
-    for (int i = 0 ; i < 100; ++ i) {
+
+    SDL_Window * window = SDL_CreateWindow("nes", 240, 256, 0);
+    SDL_ShowWindow(window);
+    SDL_Event event;
+    int app_quit = 0;
+    while (!app_quit) {
+        while (SDL_PollEvent(&event)) {
+            if (event.type == SDL_EVENT_QUIT)
+                app_quit = 1;
+            break;
+        }
         nes_clock(nes);
     }
-
-
-
-	SDL_Init(SDL_INIT_EVERYTHING);
-    SDL_Window * window = SDL_CreateWindow("nes", 300, 300, 0);
-	SDL_Quit();
+    SDL_Quit();
+    nes_destroy(nes);
     return 0;
 }
