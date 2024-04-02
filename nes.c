@@ -1,4 +1,6 @@
 #include "nes.h"
+#include "rom.h"
+#include <complex.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <string.h>
@@ -11,28 +13,11 @@
 #include <SDL.h>
 #include <SDL_hints.h>
 
-typedef struct {
-    uint8_t prg_units;
-    uint8_t chr_units;
-    uint8_t flags_6;
-    uint8_t flags_7;
-    uint8_t flags_8;
-    uint8_t flags_9;
-    uint8_t flags_10;
-    uint8_t padding[5];
-}rom_header_t;
-
-typedef struct {
-    uint8_t prg_units;
-    uint8_t chr_units;
-    uint8_t mirroring;
-    uint8_t has_trainer;
-    uint8_t has_pram;
-    uint8_t mapper;
-    uint8_t * trainer;
-    uint8_t * prg_rom;
-    uint8_t * chr_rom;
-}rom_t;
+#include "rom.h"
+#include "mapper.h"
+#ifdef I
+#undef I
+#endif
 
 typedef void (*device_io_t)(void * device, uint16_t address, uint8_t * data, uint8_t is_write);
 
@@ -580,37 +565,6 @@ void show_block(uint8_t code)
 {
     printf("\e[48;5;%dm \e[0m", code);
 }
-
-int bit_get(uint8_t * byte, uint8_t bit) {
-    return ((*byte)>>bit)&1;
-}
-
-void bit_set(uint8_t * byte, uint8_t bit)
-{
-    *byte |= (1<<bit);
-}
-
-void bit_clr(uint8_t * byte, uint8_t bit)
-{
-    *byte &= ~(1<<bit);
-}
-
-void bit_setv(uint8_t * byte, uint8_t bit, uint8_t v)
-{
-    if (v) bit_set(byte, bit);
-    else bit_clr(byte, bit);
-}
-
-void memory_io(void * memory, uint16_t offset, uint8_t * data, uint8_t is_write)
-{
-    uint8_t * bytes = (uint8_t*)memory;
-    if (is_write) {
-        bytes[offset] = *data;
-    }else {
-        *data = bytes[offset];
-    }
-}
-
 bus_t * bus_create()
 {
     bus_t * bus = (bus_t*)malloc(sizeof(bus_t));
@@ -687,61 +641,6 @@ void bus_write2(bus_t * bus, uint16_t address, uint16_t data)
     bus_io(bus, address + 1, &hi, 1);
 }
 
-
-int load_rom(char * path, rom_t * rom) {
-    FILE * fp = fopen(path, "rb");
-    if (!fp) {
-        printf("file not found\n");
-        return 0;
-    }
-    char magic[4] = {0};
-    int read_count = fread(magic, 1, 4, fp);
-    if (read_count != 4) {
-        printf("not enough bytes %d\n", read_count);
-        return 0;
-    }
-    if (memcmp(magic, "NES\x1a", 4)) {
-        printf("not a nes rom image %s\n", magic);
-        return 0;
-    }
-
-    rom_header_t header;
-    if (fread(&header, 1, sizeof(header), fp) != sizeof(header)) {
-        printf("cant read header %d\n", sizeof(header));
-        return 0;
-    }
-
-    printf("prg rom size:%d\n", header.prg_units);
-    printf("chr rom size:%d\n", header.chr_units);
-    printf("mirroring:%d\n", header.flags_6 & 0x1);
-    printf("contains battery-backed prg ram:%d\n", bit_get(&header.flags_6, 2));
-    printf("has trainer at $7000-$71ff:%d\n", bit_get(&header.flags_6,3));
-    printf("ignore mirroring control:%d\n", bit_get(&header.flags_6,4));
-    printf("mapper number:%d\n", header.flags_6 >> 4);
-
-    printf("vs unisystem:%d\n", bit_get(&header.flags_7, 0));
-    printf("play choice - 10:%d\n", bit_get(&header.flags_7, 1));
-    printf("nes version:%d\n", (bit_get(&header.flags_7, 4)<<1) | bit_get(&header.flags_7, 3));
-    printf("mapper number:%d\n", header.flags_7 >> 4);
-
-    printf("prg ram size:%d\n", header.flags_8 );
-    printf("tv system:%s\n", header.flags_9 & 1? "pal":"ntsc");
-    printf("tv system:%s\n", (header.flags_10 & 3) == 0? "pal":"ntsc");
-
-    rom->mirroring = bit_get(&header.flags_6, 0);
-    rom->has_pram = bit_get(&header.flags_6, 1);
-    rom->has_trainer = bit_get(&header.flags_6, 2);
-
-    rom->mapper = (header.flags_6 >> 4) & 0xf;
-    uint16_t prg_size = header.prg_units * 16 * 1024;
-    uint16_t chr_size = header.chr_units * 8 * 1024;
-    rom->prg_rom = (uint8_t*)malloc(prg_size);
-    rom->chr_rom = (uint8_t*)malloc(chr_size);
-    fread(rom->prg_rom, prg_size, 1, fp);
-    fread(rom->chr_rom, chr_size, 1, fp);
-    fclose(fp);
-    return 1;
-}
 
 device_t * memory_device_create(int size)
 {
@@ -1162,6 +1061,9 @@ void ppu_show_nametable()
 {
 }
 
+/*
+ * https://www.nesdev.org/wiki/PPU_rendering#Frame_timing_diagram
+ */
 void ppu_clock(ppu_t * ppu)
 {
     if (ppu->scanline == -1 && ppu->cycles == 1) {
@@ -1170,19 +1072,12 @@ void ppu_clock(ppu_t * ppu)
     if (ppu->scanline == 241 && ppu->cycles == 1) {
         bit_set(&ppu->ppu_status, V_BLANK);
     }
-}
+    if (ppu->scanline >=0 
+        && ppu->scanline <= 239 
+        && ppu->cycles > 0 
+        && ppu->cycles < 341) {
 
-void mapper_0_cpu_io(void * device, uint16_t address, uint8_t * data, uint8_t is_write)
-{
-    rom_t * rom = (rom_t*)device;
-    address -= 0x8000 - 0x4020;
-    memory_io(rom->prg_rom, address & 0x3fff, data, is_write);
-}
-
-void mapper_0_ppu_io(void * device, uint16_t address, uint8_t * data, uint8_t is_write)
-{
-    rom_t * rom = (rom_t*)device;
-    memory_io(rom->chr_rom, address, data, is_write);
+    }
 }
 
 
@@ -1194,7 +1089,9 @@ nes_t * nes_create()
     cpu_t * cpu = cpu_create();
     ppu_t * ppu = ppu_create();
 
-    bus_mount(cpu->bus, 0x2000, 0x2007, ppu->registers);
+    for (uint16_t i = 0x2000; i <= 0x3450; i += 8) {
+        bus_mount(cpu->bus, i, i+7, ppu->registers);
+    }
     bus_mount(cpu->bus, 0x4014, 0x4014, ppu->oma_registers);
 
     nes->cpu = cpu;
@@ -1232,6 +1129,7 @@ void nes_set_rom(nes_t * nes, rom_t * rom)
 
     nes->cpu_mapper = device_create(rom, mapper->cpu_io);
     nes->ppu_mapper = device_create(rom, mapper->ppu_io);
+
     bus_mount(nes->cpu->bus, 0x4020, 0xffff, nes->cpu_mapper);
     bus_mount(nes->ppu->bus, 0x0000, 0x1fff, nes->ppu_mapper);
     ppu_show_pattern_table(nes->ppu, 0);
@@ -1249,6 +1147,37 @@ void nes_clock(nes_t * nes)
 }
 
 
+void nes_set_output(nes_t * nes, device_t * output_device)
+{
+
+}
+
+typedef struct {
+    SDL_Window * window;
+    SDL_Renderer * renderer;
+    SDL_Texture * texture;
+}sdl_ouput_t;
+
+sdl_ouput_t * sdl_ouput_create()
+{
+    sdl_ouput_t * sdl_ouput = (sdl_ouput_t*)malloc(sizeof(sdl_ouput_t));
+    sdl_ouput->window = SDL_CreateWindow("nes", 480, 512, 0);
+    sdl_ouput->renderer = SDL_CreateRenderer(sdl_ouput->window, NULL, 0);
+    sdl_ouput->texture = SDL_CreateTexture(sdl_ouput->renderer, SDL_PIXELFORMAT_XRGB8888, SDL_TEXTUREACCESS_STREAMING, 240, 256);
+    SDL_SetTextureScaleMode(sdl_ouput->texture, SDL_SCALEMODE_NEAREST);
+    SDL_ShowWindow(sdl_ouput->window);
+    return sdl_ouput;
+}
+
+void sdl_ouput_destroy(sdl_ouput_t * sdl_ouput)
+{
+    SDL_DestroyWindow(sdl_ouput->window);
+    SDL_DestroyRenderer(sdl_ouput->renderer);
+    SDL_DestroyTexture(sdl_ouput->texture);
+
+    free(sdl_ouput);
+}
+
 /*
  * https://austinmorlan.com/posts/nes_rendering_overview/
  */
@@ -1258,17 +1187,19 @@ int main(int argc, char * argv[])
 	SDL_Init(SDL_INIT_VIDEO);
 
     char * rom_path = "../rom/aa.nes";
-    rom_t rom;
-    if (!load_rom(rom_path, &rom)) {
+    rom_t * rom = rom_load(rom_path);
+    if (!rom) {
         printf("load rom failed\n");
     }
 
     nes_t * nes = nes_create();
+    sdl_ouput_t * sdl_ouput = sdl_ouput_create();
+    device_t * output = device_create(sdl_ouput, NULL);
+    nes_set_output(nes, output);
     nes_power_up(nes);
-    nes_set_rom(nes,&rom);
+    nes_set_rom(nes, rom);
 
-    SDL_Window * window = SDL_CreateWindow("nes", 240, 256, 0);
-    SDL_ShowWindow(window);
+
     SDL_Event event;
     int app_quit = 0;
     while (!app_quit) {
@@ -1279,7 +1210,10 @@ int main(int argc, char * argv[])
         }
         nes_clock(nes);
     }
-    SDL_Quit();
+    rom_destroy(rom);
+    sdl_ouput_destroy(output);
     nes_destroy(nes);
+
+    SDL_Quit();
     return 0;
 }

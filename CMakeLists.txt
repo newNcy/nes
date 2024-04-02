@@ -2,7 +2,11 @@ project (nes)
 
 add_subdirectory(3rd)
 
-add_executable(nes nes.c)
+add_executable(nes 
+    mapper.c
+    rom.c
+    nes.c
+)
 add_definitions(-g)
 set(CMAKE_BUILD_TYPE Debug)
 
