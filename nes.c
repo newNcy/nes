@@ -2,8 +2,7 @@
 #include "rom.h"
 #include <complex.h>
 #include <stdatomic.h>
-#include <stdint.h>
-#include <string.h>
+#include <stdint.h> #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
@@ -430,8 +429,6 @@ typedef struct {
     uint8_t * ram;
     uint8_t inst;
     uint16_t abs;
-    int8_t rel;
-    uint8_t operand;
 }cpu_t;
 
 
@@ -526,19 +523,21 @@ typedef struct
 }object_attribute_t;
 
 typedef struct {
-    uint8_t ppu_ctrl;
-    uint8_t ppu_mask;
-    uint8_t ppu_status;
-    uint8_t oam_addr;
-    uint8_t ppu_scroll;
-    uint8_t ppu_addr;
-    uint8_t ppu_data;
-    uint8_t oam_dma;
+    uint8_t v, t, x, w; // for scroll
+    uint8_t reg_ctrl;
+    uint8_t reg_mask;
+    uint8_t reg_status;
+    uint8_t reg_oam_addr;
+    uint8_t reg_oam_data;
+    uint8_t reg_scroll;
+    uint8_t reg_ppu_addr;
+    uint8_t reg_ppu_data;
+    uint8_t reg_oam_dma;
+
     bus_t * bus;
     device_t * name_tables;
     device_t * paletters;
     device_t * registers;
-    device_t * oma_registers;
     object_attribute_t oam[64];
     uint16_t cycles;
     int16_t scanline;
@@ -563,6 +562,7 @@ typedef struct {
 typedef struct {
     cpu_t * cpu;
     ppu_t * ppu;
+    device_t * oma_registers; // 虽然是ppu上的，不过往这里写入时是从cpu传到ppu，要放这里方便同时访问
     device_t * cpu_mapper;
     device_t * ppu_mapper;
 }nes_t;
@@ -761,83 +761,73 @@ void cpu_interupt(cpu_t * cpu, cpu_int_t i)
     cpu->cycles += 7;
 }
 
-uint8_t cpu_fetch(cpu_t * cpu)
+static inline uint8_t cpu_fetch(cpu_t * cpu)
 {
     return bus_read(cpu->bus, cpu->pc++);
 }
 
-uint16_t cpu_fetch2(cpu_t * cpu)
+static inline uint16_t cpu_fetch2(cpu_t * cpu)
 {
     cpu->pc += 2;
     return bus_read2(cpu->bus, cpu->pc-2);
 }
 
+static inline uint8_t cpu_fetch_data(cpu_t * cpu)
+{
+    return bus_read(cpu->bus, cpu->abs);
+}
+
+static inline void cpu_write_data(cpu_t * cpu, uint8_t data)
+{
+    bus_write(cpu->bus, cpu->abs, data);
+}
+
 uint8_t cpu_fetch_inst(cpu_t * cpu)
 {
-    printf("$%04x ", cpu->pc);
-    cpu->inst = cpu_fetch(cpu);
+    uint16_t inst_addr = cpu->pc;
 
+    cpu->inst = cpu_fetch(cpu);
     inst_t * inst = inst_map + cpu->inst;
     cpu->cycles += inst->cycles;
-    printf("[%s %s] ", inst_tag[inst->t], address_mode_name[inst->am], inst->cycles);
     if (inst->am == IMP) {
     }else if (inst->am == IMM) {
-        cpu->operand = cpu_fetch(cpu);
-        printf("#$%02x", cpu->operand);
+        cpu->abs = cpu->pc;
+        cpu->pc ++;
     }else if (inst->am == ZP) {
         uint8_t zp = cpu_fetch(cpu);
         cpu->abs = zp;
-        cpu->operand = bus_read(cpu->bus, zp);
-        printf("$%02x %x", zp, cpu->operand);
     }else if (inst->am == ZPX) {
         uint8_t zp = cpu_fetch(cpu);
         cpu->abs = zp + cpu->x;
-        cpu->operand = bus_read(cpu->bus, zp+cpu->x);
-        printf("$%02x,X[%x] %x", zp, cpu->x, cpu->operand);
     }else if (inst->am == ZPY) {
         uint8_t zp = cpu_fetch(cpu);
         cpu->abs = zp + cpu->y;
-        cpu->operand = bus_read(cpu->bus, zp+cpu->y);
-        printf("$%02x,Y[%x]", zp, cpu->y);
     }else if (inst->am == IZX) {
         uint8_t z = cpu_fetch(cpu);
         uint8_t ptr = bus_read(cpu->bus, z + cpu->x); 
         cpu->abs = ptr;
-        cpu->operand = bus_read(cpu->bus, ptr);
-        printf("($%02x,X[%x])", z, cpu->x);
     }else if (inst->am == IZY) {
         uint8_t z = cpu_fetch(cpu);
         uint8_t ptr = bus_read(cpu->bus, z + cpu->y); 
         cpu->abs = ptr;
-        cpu->operand = bus_read(cpu->bus, ptr);
-        printf("($%02x,Y[%x])", z, cpu->y);
     }else if (inst->am == ABS) {
         uint16_t ptr = cpu_fetch2(cpu);
         cpu->abs = ptr;
-        cpu->operand = bus_read(cpu->bus, ptr);
-        printf("$%04x", ptr);
     }else if (inst->am == ABX) {
         uint16_t ptr = cpu_fetch2(cpu);
         cpu->abs = ptr + cpu->x;
-        cpu->operand = bus_read(cpu->bus, ptr+cpu->x);
-        printf("$%04x,X[%x]", ptr, cpu->x);
     }else if (inst->am == ABY) {
         uint16_t ptr = cpu_fetch2(cpu);
         cpu->abs = ptr + cpu->y;
-        cpu->operand = bus_read(cpu->bus, ptr+cpu->y);
-        printf("$%04x,Y[%x]", ptr, cpu->y);
     }else if (inst->am == IND) {
         uint16_t ptr = cpu_fetch2(cpu);
         uint16_t real_ptr = bus_read2(cpu->bus, ptr);
         cpu->abs = real_ptr;
-        cpu->operand = bus_read(cpu->bus, real_ptr);
-        printf("($%04x)", ptr);
     }else if (inst->am == REL) {
         int8_t offset = cpu_fetch(cpu);
-        cpu->rel = offset;
-        cpu->operand = bus_read(cpu->bus, cpu->pc - offset);
-        printf("pc-%x", offset & 0xff);
+        cpu->abs = inst_addr + offset;
     }
+    printf("$%04x [%s %s %02x] ", inst_addr, inst_tag[inst->t], address_mode_name[inst->am], inst->am == IMP ? 0 : cpu->abs);
 
     return 0;
 }
@@ -845,31 +835,32 @@ uint8_t cpu_fetch_inst(cpu_t * cpu)
 uint8_t cpu_exec_single(cpu_t * cpu)
 {
     inst_t * inst = inst_map + cpu->inst;
+    int8_t operand = 0;
     switch(inst->t) {
         default:
             assert(0 &&  "unsupported");
             printf(" unsupported");
             break;
         case BMI:
-            cpu->pc += cpu->rel * bit_get(&cpu->p, N);
+            cpu->pc = cpu->abs * bit_get(&cpu->p, N);
             break;
         case JSR:
             cpu_stack_push2(cpu, cpu->pc);
             cpu->pc = cpu->abs;
             break;
         case INC:
-            bus_write(cpu->bus, cpu->abs, cpu->operand+1);
+            cpu_write_data(cpu, cpu_fetch_data(cpu) + 1);
             break;
         case DEC:
-            bus_write(cpu->bus, cpu->abs, cpu->operand-1);
+            cpu_write_data(cpu, cpu_fetch_data(cpu) - 1);
             break;
         case LDA:
-            cpu->a = bus_read(cpu->bus, cpu->abs);
+            cpu->a = cpu_fetch_data(cpu);
             bit_setv(&cpu->p, N, cpu->a & 0x80);
             bit_setv(&cpu->p, Z, !cpu->a);
             break;
         case BPL:
-            cpu->pc = cpu->pc + cpu->rel * (bit_get(&cpu->p, N) == 0);
+            cpu->pc = (bit_get(&cpu->p, N) == 0)? cpu->abs: cpu->pc;
             break;
         case BRK:
             bit_clr(&cpu->p, I);
@@ -883,13 +874,13 @@ uint8_t cpu_exec_single(cpu_t * cpu)
             cpu->pc = cpu_stack_pop2(cpu);
             break;
         case STA:
-            bus_write(cpu->bus, cpu->abs, cpu->a);
+            cpu_write_data(cpu, cpu->a);
             break;
         case SEI:
             bit_set(&cpu->p, I);
             break;
         case LDX:
-            cpu->x = cpu->operand;
+            cpu->x = cpu_fetch_data(cpu);
             bit_setv(&cpu->p, Z, !cpu->x);
             bit_setv(&cpu->p, N, 0x8 & cpu->x);
             break;
@@ -900,18 +891,20 @@ uint8_t cpu_exec_single(cpu_t * cpu)
             cpu->a = cpu->x;
             break;
         case CMP:
-            bit_setv(&cpu->p, C, cpu->a >= cpu->operand);
-            bit_setv(&cpu->p, Z, cpu->a == cpu->operand);
-            bit_setv(&cpu->p, N, (cpu->a - cpu->operand) & 0x80);
+            operand = cpu_fetch_data(cpu);
+            operand = (int8_t)cpu->a - operand;
+            bit_setv(&cpu->p, C, operand > 0);
+            bit_setv(&cpu->p, Z, operand == 0);
+            bit_setv(&cpu->p, N, operand < 0);
             break;
         case BNE:
-            cpu->pc = cpu->pc + cpu->rel * (bit_get(&cpu->p, Z) == 0);
+            cpu->pc = cpu->abs * (bit_get(&cpu->p, Z) == 0);
             break;
         case STX:
             bus_write(cpu->bus, cpu->abs, cpu->x);
             break;
         case LDY:
-            cpu->y = cpu->operand;
+            cpu->y = cpu_fetch_data(cpu);
             bit_setv(&cpu->p, Z, !cpu->y);
             bit_setv(&cpu->p, N, 0x80 & cpu->y);
             break;
@@ -929,7 +922,7 @@ void cpu_clock(cpu_t * cpu)
 {
     if (cpu->cycles == 0) {
 
-        printf("[A=%02x,X=%02x,Y=%02x] [N:%d,V:%d,B:%d,D:%d,I:%d,Z:%d,C:%d] ", cpu->a, cpu->x, cpu->y, 
+        printf("[A=%02x,X=%02x,Y=%02x,S=%02x] [N:%d,V:%d,B:%d,D:%d,I:%d,Z:%d,C:%d] ", cpu->a, cpu->x, cpu->y, cpu->s,
             bit_get(&cpu->p, N),
             bit_get(&cpu->p, V),
             bit_get(&cpu->p, B),
@@ -963,19 +956,27 @@ void ppu_register_io(void * device, uint16_t address, uint8_t * byte, uint8_t is
             break;
         case 2:
             assert(!is_write && "0x2002 can only be read");
-            bit_set(&ppu->ppu_status, V_BLANK);
-            *byte = (ppu->ppu_status & 0xe0) | (ppu->ppu_data_buffer & 0x1f);
-            bit_clr(&ppu->ppu_status, V_BLANK);
+            bit_setv(byte, V_BLANK, bit_get(&ppu->reg_status, V_BLANK));
+            bit_setv(byte, SPRITE_OVERFLOW, bit_get(&ppu->reg_status, SPRITE_OVERFLOW));
+            bit_setv(byte, SPRITE_0_HINT, bit_get(&ppu->reg_status, SPRITE_0_HINT));
+            bit_clr(&ppu->reg_status, V_BLANK);
             break;
         case 3:
-            if (is_write) {
-            }
+            assert(is_write && "0x2003 can only be write");
+            ppu->reg_oam_addr = *byte;
             break;
-        case 4:
-            if (!is_write) {
-                *byte = ((uint8_t*)(ppu->oam))[ppu->oam_addr];
-            }
-            break;
+        case 4: {
+                    uint8_t * oma = (uint8_t*)ppu->oam + ppu->reg_oam_addr;
+                    if (is_write) {
+                        *oma = *byte; 
+                    }else {
+                        *byte = *oma;
+                    }
+                }
+                break;
+        case 5:
+
+                break;
         case 6:
             if (is_write) {
                 if (ppu->address_latch == 0) {
@@ -1000,9 +1001,14 @@ void ppu_register_io(void * device, uint16_t address, uint8_t * byte, uint8_t is
     }
 }
 
-void ppu_oam_register_io(void * device, uint16_t address, uint8_t * byte, uint8_t is_write) 
+void nes_oam_register_io(void * device, uint16_t address, uint8_t * byte, uint8_t is_write) 
 {
-    ppu_t * ppu = (ppu_t*)device;
+    nes_t * nes = (nes_t*)device;
+    uint16_t cpu_base = (uint16_t)*byte << 8;
+    uint8_t * oma = (uint8_t*)nes->ppu->oam;
+    for (uint16_t offset = 0x00; offset <= 0xff; ++ offset) {
+        *oma =  bus_read(nes->cpu->bus, cpu_base + offset);
+    }
 }
 
 
@@ -1020,7 +1026,6 @@ ppu_t * ppu_create()
     bus_mount(ppu->bus, 0x2000, 0x2800-1, ppu->name_tables);
 
     ppu->registers = device_create(ppu, ppu_register_io);
-    ppu->oma_registers = device_create(ppu, ppu_oam_register_io);
     return ppu;
 }
 
@@ -1030,21 +1035,18 @@ void * ppu_destroy(ppu_t * ppu)
     memory_device_destroy(ppu->paletters);
     memory_device_destroy(ppu->name_tables);
     device_destroy(ppu->registers);
-    device_destroy(ppu->oma_registers);
     free(ppu);
 }
 
 
 void ppu_power_up(ppu_t * ppu)
 {
-    bit_set(&ppu->ppu_status, SPRITE_OVERFLOW);
-    bit_clr(&ppu->ppu_status, SPRITE_0_HINT);
-    bit_set(&ppu->ppu_status, V_BLANK);
+    bit_set(&ppu->reg_status, SPRITE_OVERFLOW);
+    bit_clr(&ppu->reg_status, SPRITE_0_HINT);
+    bit_set(&ppu->reg_status, V_BLANK);
 
-    ppu->ppu_ctrl = 0;
     ppu->scanline = -1;
     ppu->cycles = 1;
-    ppu->ppu_status = 0;
 }
 
 void ppu_show_pattern_table(ppu_t * ppu, uint8_t id)
@@ -1110,10 +1112,10 @@ void ppu_show_nametable(ppu_t * ppu)
 void ppu_clock(ppu_t * ppu)
 {
     if (ppu->scanline == -1 && ppu->cycles == 1) {
-        bit_clr(&ppu->ppu_status, V_BLANK);
+        bit_clr(&ppu->reg_status, V_BLANK);
     }
     if (ppu->scanline == 241 && ppu->cycles == 1) {
-        bit_set(&ppu->ppu_status, V_BLANK);
+        bit_set(&ppu->reg_status, V_BLANK);
     }
     if (ppu->scanline >=0 && ppu->scanline <= 239 ) {
         if ( ppu->scanline == 0 && ppu->cycles == 1) {
@@ -1145,7 +1147,9 @@ nes_t * nes_create()
     for (uint16_t i = 0x2000; i <= 0x3450; i += 8) {
         bus_mount(cpu->bus, i, i+7, ppu->registers);
     }
-    bus_mount(cpu->bus, 0x4014, 0x4014, ppu->oma_registers);
+
+    nes->oma_registers = device_create(nes, nes_oam_register_io);
+    bus_mount(cpu->bus, 0x4014, 0x4014, nes->oma_registers);
 
     nes->cpu = cpu;
     nes->ppu = ppu;
@@ -1154,6 +1158,7 @@ nes_t * nes_create()
 
 void nes_destroy(nes_t * nes)
 {
+    device_destroy(nes->oma_registers);
     cpu_destroy(nes->cpu);
     ppu_destroy(nes->ppu);
 
