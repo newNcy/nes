@@ -1,4 +1,6 @@
 #include "nes.h"
+#include "rom.h"
+#include <complex.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <string.h>
@@ -11,28 +13,11 @@
 #include <SDL.h>
 #include <SDL_hints.h>
 
-typedef struct {
-    uint8_t prg_units;
-    uint8_t chr_units;
-    uint8_t flags_6;
-    uint8_t flags_7;
-    uint8_t flags_8;
-    uint8_t flags_9;
-    uint8_t flags_10;
-    uint8_t padding[5];
-}rom_header_t;
-
-typedef struct {
-    uint8_t prg_units;
-    uint8_t chr_units;
-    uint8_t mirroring;
-    uint8_t has_trainer;
-    uint8_t has_pram;
-    uint8_t mapper;
-    uint8_t * trainer;
-    uint8_t * prg_rom;
-    uint8_t * chr_rom;
-}rom_t;
+#include "rom.h"
+#include "mapper.h"
+#ifdef I
+#undef I
+#endif
 
 typedef void (*device_io_t)(void * device, uint16_t address, uint8_t * data, uint8_t is_write);
 
@@ -94,6 +79,10 @@ static char * inst_tag[] = {
     "ldy","tay","bcs","clv","lda","ldx","lax","las","tax","tsx",
     "cpy","iny","bne","cld","cmp","dec","dex","dcp","axs",
     "cpx","inx","beq","sed","sbc","inc","isc"
+};
+
+static char * address_mode_name[] = {
+    "", "IMM", "ZP", "ZP+X", "ZP+Y", "IZX", "IZY", "ABS", "ABX", "ABY", "IND", "REL"
 };
 
 /* http://www.oxyron.de/html/opcodes02.html */ 
@@ -556,6 +545,13 @@ typedef struct {
     uint8_t address_latch;
     uint16_t ppu_data_address;
     uint8_t ppu_data_buffer;
+    uint16_t nametable_address_base;
+    uint16_t pattern_table_address_8x8;
+    uint16_t pattern_table_address_background;
+    uint8_t nmi_on_vblank;
+    uint16_t vram_increment;
+    uint8_t spirate_size_16;
+    device_t * output;
 }ppu_t;
 
 
@@ -580,37 +576,6 @@ void show_block(uint8_t code)
 {
     printf("\e[48;5;%dm \e[0m", code);
 }
-
-int bit_get(uint8_t * byte, uint8_t bit) {
-    return ((*byte)>>bit)&1;
-}
-
-void bit_set(uint8_t * byte, uint8_t bit)
-{
-    *byte |= (1<<bit);
-}
-
-void bit_clr(uint8_t * byte, uint8_t bit)
-{
-    *byte &= ~(1<<bit);
-}
-
-void bit_setv(uint8_t * byte, uint8_t bit, uint8_t v)
-{
-    if (v) bit_set(byte, bit);
-    else bit_clr(byte, bit);
-}
-
-void memory_io(void * memory, uint16_t offset, uint8_t * data, uint8_t is_write)
-{
-    uint8_t * bytes = (uint8_t*)memory;
-    if (is_write) {
-        bytes[offset] = *data;
-    }else {
-        *data = bytes[offset];
-    }
-}
-
 bus_t * bus_create()
 {
     bus_t * bus = (bus_t*)malloc(sizeof(bus_t));
@@ -688,65 +653,11 @@ void bus_write2(bus_t * bus, uint16_t address, uint16_t data)
 }
 
 
-int load_rom(char * path, rom_t * rom) {
-    FILE * fp = fopen(path, "rb");
-    if (!fp) {
-        printf("file not found\n");
-        return 0;
-    }
-    char magic[4] = {0};
-    int read_count = fread(magic, 1, 4, fp);
-    if (read_count != 4) {
-        printf("not enough bytes %d\n", read_count);
-        return 0;
-    }
-    if (memcmp(magic, "NES\x1a", 4)) {
-        printf("not a nes rom image %s\n", magic);
-        return 0;
-    }
-
-    rom_header_t header;
-    if (fread(&header, 1, sizeof(header), fp) != sizeof(header)) {
-        printf("cant read header %d\n", sizeof(header));
-        return 0;
-    }
-
-    printf("prg rom size:%d\n", header.prg_units);
-    printf("chr rom size:%d\n", header.chr_units);
-    printf("mirroring:%d\n", header.flags_6 & 0x1);
-    printf("contains battery-backed prg ram:%d\n", bit_get(&header.flags_6, 2));
-    printf("has trainer at $7000-$71ff:%d\n", bit_get(&header.flags_6,3));
-    printf("ignore mirroring control:%d\n", bit_get(&header.flags_6,4));
-    printf("mapper number:%d\n", header.flags_6 >> 4);
-
-    printf("vs unisystem:%d\n", bit_get(&header.flags_7, 0));
-    printf("play choice - 10:%d\n", bit_get(&header.flags_7, 1));
-    printf("nes version:%d\n", (bit_get(&header.flags_7, 4)<<1) | bit_get(&header.flags_7, 3));
-    printf("mapper number:%d\n", header.flags_7 >> 4);
-
-    printf("prg ram size:%d\n", header.flags_8 );
-    printf("tv system:%s\n", header.flags_9 & 1? "pal":"ntsc");
-    printf("tv system:%s\n", (header.flags_10 & 3) == 0? "pal":"ntsc");
-
-    rom->mirroring = bit_get(&header.flags_6, 0);
-    rom->has_pram = bit_get(&header.flags_6, 1);
-    rom->has_trainer = bit_get(&header.flags_6, 2);
-
-    rom->mapper = (header.flags_6 >> 4) & 0xf;
-    uint16_t prg_size = header.prg_units * 16 * 1024;
-    uint16_t chr_size = header.chr_units * 8 * 1024;
-    rom->prg_rom = (uint8_t*)malloc(prg_size);
-    rom->chr_rom = (uint8_t*)malloc(chr_size);
-    fread(rom->prg_rom, prg_size, 1, fp);
-    fread(rom->chr_rom, chr_size, 1, fp);
-    fclose(fp);
-    return 1;
-}
-
 device_t * memory_device_create(int size)
 {
     device_t * device = (device_t *) malloc(sizeof(device_t));
     device->data = malloc(size);
+    memset(device->data, 0, size);
     device->io = memory_io;
     return device;
 }
@@ -774,6 +685,7 @@ void device_destroy(device_t * device)
 cpu_t * cpu_create()
 {
     cpu_t * cpu = (cpu_t*)malloc(sizeof(cpu_t));
+    memset(cpu, 0, sizeof(cpu));
     cpu->ram = (uint8_t*)malloc(0x800);
     cpu->ram = memory_device_create(0x800);
     cpu->bus = bus_create();
@@ -798,6 +710,7 @@ void cpu_stack_push(cpu_t * cpu, uint8_t byte)
     cpu->s --;
     bus_write(cpu->bus, cpu->s, byte);
 }
+
 void cpu_stack_push2(cpu_t * cpu, uint16_t byte)
 {
     cpu->s -= 2;
@@ -866,7 +779,7 @@ uint8_t cpu_fetch_inst(cpu_t * cpu)
 
     inst_t * inst = inst_map + cpu->inst;
     cpu->cycles += inst->cycles;
-    printf("[%02x %s] ", cpu->inst, inst_tag[inst->t], inst->am, inst->cycles);
+    printf("[%s %s] ", inst_tag[inst->t], address_mode_name[inst->am], inst->cycles);
     if (inst->am == IMP) {
     }else if (inst->am == IMM) {
         cpu->operand = cpu_fetch(cpu);
@@ -934,6 +847,7 @@ uint8_t cpu_exec_single(cpu_t * cpu)
     inst_t * inst = inst_map + cpu->inst;
     switch(inst->t) {
         default:
+            assert(0 &&  "unsupported");
             printf(" unsupported");
             break;
         case BMI:
@@ -1015,7 +929,7 @@ void cpu_clock(cpu_t * cpu)
 {
     if (cpu->cycles == 0) {
 
-        printf("[%02x:%02x:%02x] [%d:%d:%d:%d:%d:%d:%d] ", cpu->a, cpu->x, cpu->y, 
+        printf("[A=%02x,X=%02x,Y=%02x] [N:%d,V:%d,B:%d,D:%d,I:%d,Z:%d,C:%d] ", cpu->a, cpu->x, cpu->y, 
             bit_get(&cpu->p, N),
             bit_get(&cpu->p, V),
             bit_get(&cpu->p, B),
@@ -1035,15 +949,23 @@ void cpu_clock(cpu_t * cpu)
 void ppu_register_io(void * device, uint16_t address, uint8_t * byte, uint8_t is_write) 
 {
     ppu_t * ppu = (ppu_t*)device;
+    uint16_t base[] = {0x2000, 0x2400, 0x2800, 0x2c00};
     switch(address) {
         case 0:
+            ppu->nametable_address_base = base[*byte & 0x03];
+            ppu->vram_increment = bit_get(byte, 2) ? 32 : 1;
+            ppu->pattern_table_address_8x8 = bit_get(byte, 3) * 0x1000;
+            ppu->pattern_table_address_background = bit_get(byte, 4) * 0x1000;
+            ppu->spirate_size_16 = bit_get(byte, 5);
+            ppu->nmi_on_vblank = bit_get(byte, 7);
+            break;
+        case 1:
             break;
         case 2:
-            if (!is_write) {
-                bit_set(&ppu->ppu_status, V_BLANK);
-                *byte = (ppu->ppu_status & 0xe0) | (ppu->ppu_data_buffer & 0x1f);
-                bit_clr(&ppu->ppu_status, V_BLANK);
-            }
+            assert(!is_write && "0x2002 can only be read");
+            bit_set(&ppu->ppu_status, V_BLANK);
+            *byte = (ppu->ppu_status & 0xe0) | (ppu->ppu_data_buffer & 0x1f);
+            bit_clr(&ppu->ppu_status, V_BLANK);
             break;
         case 3:
             if (is_write) {
@@ -1094,6 +1016,9 @@ ppu_t * ppu_create()
     bus_mount(ppu->bus, 0x3f00, 0x3f1f, ppu->paletters);
     bus_mount(ppu->bus, 0x3f20, 0x3fff, ppu->paletters);
 
+    ppu->name_tables = memory_device_create(0x2800 - 0x2000);
+    bus_mount(ppu->bus, 0x2000, 0x2800-1, ppu->name_tables);
+
     ppu->registers = device_create(ppu, ppu_register_io);
     ppu->oma_registers = device_create(ppu, ppu_oam_register_io);
     return ppu;
@@ -1103,6 +1028,7 @@ void * ppu_destroy(ppu_t * ppu)
 {
     bus_destroy(ppu->bus);
     memory_device_destroy(ppu->paletters);
+    memory_device_destroy(ppu->name_tables);
     device_destroy(ppu->registers);
     device_destroy(ppu->oma_registers);
     free(ppu);
@@ -1114,6 +1040,11 @@ void ppu_power_up(ppu_t * ppu)
     bit_set(&ppu->ppu_status, SPRITE_OVERFLOW);
     bit_clr(&ppu->ppu_status, SPRITE_0_HINT);
     bit_set(&ppu->ppu_status, V_BLANK);
+
+    ppu->ppu_ctrl = 0;
+    ppu->scanline = -1;
+    ppu->cycles = 1;
+    ppu->ppu_status = 0;
 }
 
 void ppu_show_pattern_table(ppu_t * ppu, uint8_t id)
@@ -1158,10 +1089,24 @@ void ppu_show_pattern_table(ppu_t * ppu, uint8_t id)
     SDL_ShowWindow(window);
 }
 
-void ppu_show_nametable()
+void ppu_show_nametable(ppu_t * ppu)
 {
+    uint16_t nametable_address = 0x2000;
+    for (int i = 0; i < 30; ++ i) {
+        for (int j = 0; j < 32; ++ j) {
+            uint8_t tile_idx = bus_read(ppu->bus, nametable_address + i*30 + j);
+            printf("%02x ", tile_idx);
+        }
+        printf("\n");
+    }
+
+    getchar();
 }
 
+
+/*
+ * https://www.nesdev.org/wiki/PPU_rendering#Frame_timing_diagram
+ */
 void ppu_clock(ppu_t * ppu)
 {
     if (ppu->scanline == -1 && ppu->cycles == 1) {
@@ -1170,19 +1115,22 @@ void ppu_clock(ppu_t * ppu)
     if (ppu->scanline == 241 && ppu->cycles == 1) {
         bit_set(&ppu->ppu_status, V_BLANK);
     }
-}
+    if (ppu->scanline >=0 && ppu->scanline <= 239 ) {
+        if ( ppu->scanline == 0 && ppu->cycles == 1) {
+            ppu_show_nametable(ppu);
+        }
+    }
 
-void mapper_0_cpu_io(void * device, uint16_t address, uint8_t * data, uint8_t is_write)
-{
-    rom_t * rom = (rom_t*)device;
-    address -= 0x8000 - 0x4020;
-    memory_io(rom->prg_rom, address & 0x3fff, data, is_write);
-}
+    ppu->cycles ++;
+    if (ppu->cycles == 341) {
+        ppu->scanline ++;
+        ppu->cycles = 1;
 
-void mapper_0_ppu_io(void * device, uint16_t address, uint8_t * data, uint8_t is_write)
-{
-    rom_t * rom = (rom_t*)device;
-    memory_io(rom->chr_rom, address, data, is_write);
+        if (ppu->scanline == 261) {
+        ppu->scanline = -1;
+        }
+    }
+
 }
 
 
@@ -1194,7 +1142,9 @@ nes_t * nes_create()
     cpu_t * cpu = cpu_create();
     ppu_t * ppu = ppu_create();
 
-    bus_mount(cpu->bus, 0x2000, 0x2007, ppu->registers);
+    for (uint16_t i = 0x2000; i <= 0x3450; i += 8) {
+        bus_mount(cpu->bus, i, i+7, ppu->registers);
+    }
     bus_mount(cpu->bus, 0x4014, 0x4014, ppu->oma_registers);
 
     nes->cpu = cpu;
@@ -1232,6 +1182,7 @@ void nes_set_rom(nes_t * nes, rom_t * rom)
 
     nes->cpu_mapper = device_create(rom, mapper->cpu_io);
     nes->ppu_mapper = device_create(rom, mapper->ppu_io);
+
     bus_mount(nes->cpu->bus, 0x4020, 0xffff, nes->cpu_mapper);
     bus_mount(nes->ppu->bus, 0x0000, 0x1fff, nes->ppu_mapper);
     ppu_show_pattern_table(nes->ppu, 0);
@@ -1249,6 +1200,37 @@ void nes_clock(nes_t * nes)
 }
 
 
+void nes_set_output(nes_t * nes, device_t * output_device)
+{
+    nes->ppu->output = output_device;
+}
+
+typedef struct {
+    SDL_Window * window;
+    SDL_Renderer * renderer;
+    SDL_Texture * texture;
+}sdl_ouput_t;
+
+sdl_ouput_t * sdl_ouput_create()
+{
+    sdl_ouput_t * sdl_ouput = (sdl_ouput_t*)malloc(sizeof(sdl_ouput_t));
+    sdl_ouput->window = SDL_CreateWindow("nes", 512, 480, 0);
+    sdl_ouput->renderer = SDL_CreateRenderer(sdl_ouput->window, NULL, 0);
+    sdl_ouput->texture = SDL_CreateTexture(sdl_ouput->renderer, SDL_PIXELFORMAT_XRGB8888, SDL_TEXTUREACCESS_STREAMING, 256, 240);
+    SDL_SetTextureScaleMode(sdl_ouput->texture, SDL_SCALEMODE_NEAREST);
+    SDL_ShowWindow(sdl_ouput->window);
+    return sdl_ouput;
+}
+
+void sdl_ouput_destroy(sdl_ouput_t * sdl_ouput)
+{
+    SDL_DestroyWindow(sdl_ouput->window);
+    SDL_DestroyRenderer(sdl_ouput->renderer);
+    SDL_DestroyTexture(sdl_ouput->texture);
+
+    free(sdl_ouput);
+}
+
 /*
  * https://austinmorlan.com/posts/nes_rendering_overview/
  */
@@ -1258,17 +1240,19 @@ int main(int argc, char * argv[])
 	SDL_Init(SDL_INIT_VIDEO);
 
     char * rom_path = "../rom/aa.nes";
-    rom_t rom;
-    if (!load_rom(rom_path, &rom)) {
+    rom_t * rom = rom_load(rom_path);
+    if (!rom) {
         printf("load rom failed\n");
     }
 
     nes_t * nes = nes_create();
+    sdl_ouput_t * sdl_ouput = sdl_ouput_create();
+    device_t * output = device_create(sdl_ouput, NULL);
+    nes_set_output(nes, output);
     nes_power_up(nes);
-    nes_set_rom(nes,&rom);
+    nes_set_rom(nes, rom);
 
-    SDL_Window * window = SDL_CreateWindow("nes", 240, 256, 0);
-    SDL_ShowWindow(window);
+
     SDL_Event event;
     int app_quit = 0;
     while (!app_quit) {
@@ -1279,7 +1263,10 @@ int main(int argc, char * argv[])
         }
         nes_clock(nes);
     }
-    SDL_Quit();
+    rom_destroy(rom);
+    sdl_ouput_destroy(output);
     nes_destroy(nes);
+
+    SDL_Quit();
     return 0;
 }
