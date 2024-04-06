@@ -1,7 +1,8 @@
 #pragma once
 #include <stdint.h>
+#include <stdint.h>
 
-static inline int bit_get(uint8_t * byte, uint8_t bit) {
+static inline uint8_t bit_get(uint8_t * byte, uint8_t bit) {
     return ((*byte)>>bit)&1;
 }
 
