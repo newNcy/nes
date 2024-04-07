@@ -575,6 +575,7 @@ typedef struct {
     uint8_t reg_ppu_addr;
     uint8_t reg_ppu_data;
     uint8_t reg_oam_dma;
+    uint8_t nmi;
 
     bus_t * bus;
     device_t * name_tables;
@@ -1149,7 +1150,7 @@ void cpu_debug_show_detail(cpu_t * cpu)
     inst_t * inst = inst_map + cpu->inst;
     nes_log("$%04x %02x[%s %s %02x(%d)]", cpu->inst_addr, cpu->inst, inst_tag[inst->t], address_mode_name[inst->am], inst->am == IMP ? 0 : cpu->abs, inst->am == REL ? cpu->rel: 0);
     //cpu_debug_stack_frame_unwind(cpu->debug_call_stack);
-    cpu_debug_dump_stack(cpu);
+    //cpu_debug_dump_stack(cpu);
     nes_log("\n");
 }
 
@@ -1161,10 +1162,13 @@ void cpu_clock(cpu_t * cpu)
 
         cpu->cycles += cpu_fetch_inst(cpu);
 
-        if (bit_get(&cpu->p, I)) {
+        if (cpu->abs == 0x04) {
             cpu_debug_show_detail(cpu);
         }
         cpu->cycles += cpu_exec_single(cpu);
+        if (cpu->abs == 0x04) {
+            cpu_debug_show_detail(cpu);
+        }
     }
     cpu->cycles --;
 }
@@ -1241,8 +1245,12 @@ void ppu_register_io(void * device, uint16_t address, uint8_t * byte, uint8_t is
     /* read 0x2002 will clear V_BLANK bit and w latch register */
     if (address == 0 && is_write) {
         ppu_vt_set_nametable_idx(&ppu->t, ppu->reg_ctrl&0x3);
+        if (bit_get(byte, 7) && bit_get(&ppu->reg_status, V_BLANK)) {
+            ppu->nmi = 1;
+        }
     } else if (!is_write && address == 2) {
         bit_clr(&ppu->reg_status, V_BLANK);
+        ppu->nmi = 0;
         ppu->w = 0;
     } else if (address == 5) {
         if (!ppu->w) {
@@ -1482,6 +1490,9 @@ void ppu_clock(ppu_t * ppu)
     /* vertical blank*/
     if (ppu->scanline == 241 && ppu->cycles == 1) {
         bit_set(&ppu->reg_status, V_BLANK);
+        if (bit_get(&ppu->reg_ctrl, 7)) {
+            ppu->nmi = 1;
+        }
     }
 
     /* 261 * 340 cycles wrap */
@@ -1563,25 +1574,15 @@ void nes_set_rom(nes_t * nes, rom_t * rom)
     cpu_interupt(nes->cpu, RESET);
 }
 
-static inline int nes_should_trigger_nmi(nes_t * nes) 
-{
-    ppu_t * ppu = nes->ppu;
-    if (bit_get(&ppu->reg_ctrl, 7) ) {
-        uint8_t status = bus_read(nes->cpu->bus, 0x2002);
-        if (bit_get(&status, V_BLANK)) {
-            return 1;
-        }
-    }
-    return 0;
-}
 
 void nes_clock(nes_t * nes)
 {
     cpu_clock(nes->cpu);
     for (int i = 0; i < 3; ++ i) {
         ppu_clock(nes->ppu);
-        if (nes_should_trigger_nmi(nes)) {
+        if (nes->ppu->nmi) {
             cpu_interupt(nes->cpu, NMI);
+            nes->ppu->nmi = 0;
         }
     }
 }
