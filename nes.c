@@ -6,6 +6,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <assert.h>
 
 
@@ -13,7 +14,9 @@
 #include <SDL_hints.h>
 
 #include "rom.h"
+#include "log.h"
 #include "mapper.h"
+
 #ifdef I
 #undef I
 #endif
@@ -83,10 +86,10 @@ void cpu_debug_stack_frame_unwind(cpu_debug_stack_frame_t * frame)
     }
     cpu_debug_stack_frame_unwind(frame->last);
     if (frame->last) {
-        printf("...%x", frame->return_address);
-        printf(">>");
+        nes_log("...%x", frame->return_address);
+        nes_log(">>");
     }
-    printf("%x", frame->address);
+    nes_log("%x", frame->address);
 }
 
 /* https://www.nesdev.org/wiki/CPU_unofficial_opcodes */
@@ -610,7 +613,7 @@ uint8_t calc_color(color_t c)
 
 void show_block(uint8_t code)
 {
-    printf("\e[48;5;%dm \e[0m", code);
+    nes_log("\e[48;5;%dm \e[0m", code);
 }
 bus_t * bus_create()
 {
@@ -808,7 +811,7 @@ void cpu_interupt(cpu_t * cpu, cpu_int_t i)
     if (i == IRQ && bit_get(&cpu->p,I)) {
         return;
     }
-    printf("cpu_interupt %d\n", i);
+    nes_log("cpu_interupt %d\n", i);
 
     bit_set(&cpu->p, I);
     uint16_t vector = 0xfffa + i * 2;
@@ -836,6 +839,10 @@ static inline uint8_t cpu_fetch_data(cpu_t * cpu)
 
 static inline void cpu_write_data(cpu_t * cpu, uint8_t data)
 {
+    if (cpu->abs == 0x2007 && data) {
+        nes_log("write none zero to nt addr:%x data:%x\n", cpu->abs, data);
+        getchar();
+    }
     bus_write(cpu->bus, cpu->abs, data);
 }
 
@@ -883,7 +890,7 @@ uint8_t cpu_fetch_inst(cpu_t * cpu)
         cpu->abs = ptr + cpu->y;
     }else if (inst->am == IND) {
         uint16_t ptr = cpu_fetch2(cpu);
-        printf("ptr %x\n", ptr);
+        nes_log("ptr %x\n", ptr);
         uint16_t real_ptr = bus_read2(cpu->bus, ptr);
         cpu->abs = real_ptr;
     }else if (inst->am == REL) {
@@ -1109,7 +1116,7 @@ uint8_t cpu_exec_single(cpu_t * cpu)
             break;
 
         default:
-            printf("unsupported\n");
+            nes_log("unsupported\n");
             exit(0);
             break;
     }
@@ -1119,16 +1126,16 @@ uint8_t cpu_exec_single(cpu_t * cpu)
 
 void cpu_debug_dump_stack(cpu_t * cpu)
 {
-    printf(" ");
+    nes_log(" ");
     for (uint16_t addr = 0xfe; addr > cpu->s; -- addr) {
         uint8_t byte = bus_read(cpu->bus, addr + 0x100);
-        printf("%02x ", byte);
+        nes_log("%02x ", byte);
     }
 }
 
 void cpu_debug_show_detail(cpu_t * cpu)
 {
-    printf("%d [A=%02x,X=%02x,Y=%02x,S=%02x] [%c%c%c%c%c%c%c] ", 
+    nes_log("%d [A=%02x,X=%02x,Y=%02x,S=%02x] [%c%c%c%c%c%c%c] ", 
             cpu->debug_ins_count,
             cpu->a, cpu->x, cpu->y, cpu->s,
             bit_get(&cpu->p, N) ? 'N':'-',
@@ -1140,10 +1147,10 @@ void cpu_debug_show_detail(cpu_t * cpu)
             bit_get(&cpu->p, C) ? 'C':'-'
           );
     inst_t * inst = inst_map + cpu->inst;
-    printf("$%04x %02x[%s %s %02x(%d)]", cpu->inst_addr, cpu->inst, inst_tag[inst->t], address_mode_name[inst->am], inst->am == IMP ? 0 : cpu->abs, inst->am == REL ? cpu->rel: 0);
+    nes_log("$%04x %02x[%s %s %02x(%d)]", cpu->inst_addr, cpu->inst, inst_tag[inst->t], address_mode_name[inst->am], inst->am == IMP ? 0 : cpu->abs, inst->am == REL ? cpu->rel: 0);
     //cpu_debug_stack_frame_unwind(cpu->debug_call_stack);
     cpu_debug_dump_stack(cpu);
-    printf("\n");
+    nes_log("\n");
 }
 
 void cpu_clock(cpu_t * cpu)
@@ -1153,7 +1160,10 @@ void cpu_clock(cpu_t * cpu)
         cpu->debug_ins_count ++;
 
         cpu->cycles += cpu_fetch_inst(cpu);
-        cpu_debug_show_detail(cpu);
+
+        if (bit_get(&cpu->p, I)) {
+            cpu_debug_show_detail(cpu);
+        }
         cpu->cycles += cpu_exec_single(cpu);
     }
     cpu->cycles --;
@@ -1298,7 +1308,7 @@ void * ppu_destroy(ppu_t * ppu)
 
 void ppu_power_up(ppu_t * ppu)
 {
-    ppu->reg_status = 0;
+    ppu->reg_status = 0x80;
     ppu->scanline = -1;
     ppu->cycles = 1;
 }
@@ -1336,9 +1346,9 @@ void ppu_show_pattern_table(ppu_t * ppu, uint8_t id)
 
     for (int i = 0; i < 128; ++ i) {
         for (int j = 0; j < 128; ++ j) {
-            printf("%d", pattern[i*128+j]);
+            nes_log("%d", pattern[i*128+j]);
         }
-        printf("\n");
+        nes_log("\n");
     }
     SDL_UpdateTexture(renderBuffer, NULL, pixels, 4*128);
     SDL_RenderTexture(renderer, renderBuffer, NULL, NULL);
@@ -1352,16 +1362,16 @@ void ppu_show_nametable(ppu_t * ppu)
     for (int i = 0; i < 30; ++ i) {
         for (int j = 0; j < 32; ++ j) {
             uint8_t tile_idx = bus_read(ppu->bus, nametable_address + i*30 + j);
-            printf("%02x ", tile_idx);
+            nes_log("%02x ", tile_idx);
         }
-        printf("\n");
+        nes_log("\n");
     }
 }
 
 
 void ppu_debug_show_detail(ppu_t * ppu)
 {
-    printf("%d%d%d%d %d%d%d%d\n", 
+    nes_log("%d%d%d%d %d%d%d%d\n", 
             bit_get(&ppu->reg_status, 7),
             bit_get(&ppu->reg_status, 6),
             bit_get(&ppu->reg_status, 5),
@@ -1386,7 +1396,8 @@ void ppu_produce_bg_pixel(ppu_t * ppu)
         }
         color_t c = system_palette[index];
         uint32_t pixel = (c.r << 24) | (c.g << 16) | c.b;
-        ppu->output->set_pixel(ppu->output->data, x, ppu->scanline, pixel);
+        //ppu->output->set_pixel(ppu->output->data, x, ppu->scanline, pixel);
+        //nes_log("x:%d y:%d c:%x tile:%d attr:%d \n", x, ppu->scanline, pixel, ppu->tile, ppu->attribute);
     }
 }
 
@@ -1405,6 +1416,7 @@ void ppu_clock(ppu_t * ppu)
     /* pre-scanline */
     if (ppu->scanline == -1 && ppu->cycles == 1) {
         bit_clr(&ppu->reg_status, V_BLANK);
+        nes_log("v blank\n");
         /* 257 复制水平位置相关的bits */
         if (ppu->cycles >= 280 && ppu->cycles <= 304) {
             v |= ppu->t & 0x7be0;
@@ -1412,9 +1424,7 @@ void ppu_clock(ppu_t * ppu)
     }
     
 
-    
-
-    if (ppu->cycles >= 1 && ppu->cycles <= 256 ) {
+    if (0 && ppu->cycles >= 1 && ppu->cycles <= 256 ) {
         /* 4次访存 每次2 周期 */
         switch((ppu->cycles-1)% 8) {
             /* 
@@ -1509,6 +1519,12 @@ nes_t * nes_create()
 
 void nes_destroy(nes_t * nes)
 {
+    if (nes->cpu_mapper) {
+        device_destroy(nes->cpu_mapper);
+    }
+    if (nes->ppu_mapper) {
+        device_destroy(nes->ppu_mapper);
+    }
     device_destroy(nes->oma_registers);
     cpu_destroy(nes->cpu);
     ppu_destroy(nes->ppu);
@@ -1524,11 +1540,11 @@ void nes_power_up(nes_t * nes)
 
 void nes_set_rom(nes_t * nes, rom_t * rom)
 {
-    if (!nes->cpu_mapper) {
-        nes->cpu_mapper = device_create(NULL, NULL);
+    if (nes->cpu_mapper) {
+        device_destroy(nes->cpu_mapper);
     }
-    if (!nes->ppu_mapper) {
-        nes->ppu_mapper = device_create(NULL, NULL);
+    if (nes->ppu_mapper) {
+        device_destroy(nes->ppu_mapper);
     }
     mapper_t mappers[] = {
         {mapper_0_cpu_io, mapper_0_ppu_io},
@@ -1542,7 +1558,7 @@ void nes_set_rom(nes_t * nes, rom_t * rom)
     bus_mount(nes->cpu->bus, 0x4020, 0xffff, nes->cpu_mapper);
     bus_mount(nes->ppu->bus, 0x0000, 0x1fff, nes->ppu_mapper);
     ppu_show_pattern_table(nes->ppu, 0);
-    printf("%\n");
+    nes_log("%\n");
     ppu_show_pattern_table(nes->ppu, 1);
     cpu_interupt(nes->cpu, RESET);
 }
@@ -1550,11 +1566,13 @@ void nes_set_rom(nes_t * nes, rom_t * rom)
 static inline int nes_should_trigger_nmi(nes_t * nes) 
 {
     ppu_t * ppu = nes->ppu;
-    uint8_t res = bit_get(&ppu->reg_status, V_BLANK) && bit_get(&ppu->reg_ctrl, 7); 
-    if (res) {
-        bit_clr(&ppu->reg_status, V_BLANK);
+    if (bit_get(&ppu->reg_ctrl, 7) ) {
+        uint8_t status = bus_read(nes->cpu->bus, 0x2002);
+        if (bit_get(&status, V_BLANK)) {
+            return 1;
+        }
     }
-    return res;
+    return 0;
 }
 
 void nes_clock(nes_t * nes)
@@ -1623,15 +1641,16 @@ void sdl_ouput_set_pixel(sdl_ouput_t * sdl_ouput, uint16_t x, uint16_t y, uint32
 
 int main(int argc, char * argv[]) 
 {
-    SDL_Init(SDL_INIT_VIDEO);
+    //SDL_Init(SDL_INIT_VIDEO);
 
     char * rom_path = "../rom/aa.nes";
     rom_t * rom = rom_load(rom_path);
     if (!rom) {
-        printf("load rom failed\n");
+        nes_log("load rom failed\n");
     }
 
     nes_t * nes = nes_create();
+    nes_set_logfile("nes.log");
     sdl_ouput_t * sdl_ouput = sdl_ouput_create(256, 240);
     output_t * output = output_create(sdl_ouput, (set_pixel_t)sdl_ouput_set_pixel);
     nes_set_output(nes, output);
@@ -1642,13 +1661,14 @@ int main(int argc, char * argv[])
     SDL_Event event;
     int app_quit = 0;
     while (!app_quit) {
+        nes_clock(nes);
         while (SDL_PollEvent(&event)) {
             if (event.type == SDL_EVENT_QUIT)
                 app_quit = 1;
             break;
         }
-        nes_clock(nes);
     }
+
     rom_destroy(rom);
     sdl_ouput_destroy(sdl_ouput);
     device_destroy(output);
