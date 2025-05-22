@@ -10,8 +10,7 @@
 #include <assert.h>
 
 
-#include <SDL.h>
-#include <SDL_hints.h>
+#include <SDL3/SDL.h>
 
 #include "rom.h"
 #include "log.h"
@@ -52,6 +51,7 @@ typedef struct {
 typedef enum {
     C, Z, I, D, B, V = 6, N
 }cpu_flag_t;
+
 
 typedef enum {
     NMI, RESET, IRQ
@@ -585,8 +585,8 @@ typedef struct {
     uint16_t cycles;
     int16_t scanline;
 
-    uint8_t tile; 
-    uint8_t attribute; 
+    uint8_t nt; 
+    uint8_t at; 
     /* 为什么分2次，因为一行的8个像素是由两个字节的第i位合起来表示的 */
     uint8_t pattern_0;
     uint8_t pattern_1;
@@ -792,6 +792,7 @@ void cpu_power_up(cpu_t * cpu)
     bit_clr(&cpu->p, V);
     bit_clr(&cpu->p, N);
     bit_set(&cpu->p, I);
+    cpu->pc = 0xfffc;
     cpu->a = 0;
     cpu->x = 0;
     cpu->y = 0;
@@ -1316,17 +1317,21 @@ void * ppu_destroy(ppu_t * ppu)
 
 void ppu_power_up(ppu_t * ppu)
 {
-    ppu->reg_status = 0x80;
-    ppu->scanline = -1;
-    ppu->cycles = 1;
+    ppu->reg_status = 0;
+    bit_set(&ppu->reg_status, V_BLANK);
+    ppu->reg_ctrl = 0;
+    ppu->reg_mask = 0;
+
+    ppu->scanline = 261;
+    ppu->cycles = 0;
 }
 
 void ppu_show_pattern_table(ppu_t * ppu, uint8_t id)
 {
-    return;
-    SDL_Window * window = SDL_CreateWindow("pattern", 256, 256, 0);
 
-    SDL_Renderer * renderer = SDL_CreateRenderer(window, NULL, 0);
+    SDL_Window * window = SDL_CreateWindow("pattern", 256, 256, SDL_WINDOW_OPENGL);
+
+    SDL_Renderer * renderer = SDL_CreateRenderer(window, NULL);
     SDL_Texture * renderBuffer = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_XRGB8888, SDL_TEXTUREACCESS_STREAMING, 128, 128);
     SDL_SetTextureScaleMode(renderBuffer, SDL_SCALEMODE_NEAREST);
 
@@ -1396,17 +1401,6 @@ void ppu_debug_show_detail(ppu_t * ppu)
 
 void ppu_produce_bg_pixel(ppu_t * ppu) 
 {
-    for (uint16_t x = ppu->cycles - 8; x < ppu->cycles; ++ x) {
-        uint8_t out = bit_get(&ppu->pattern_0, 7-x) + bit_get(&ppu->pattern_1, 7-x);
-        uint16_t index = out;
-        if (index != 0) {
-            getchar();
-        }
-        color_t c = system_palette[index];
-        uint32_t pixel = (c.r << 24) | (c.g << 16) | c.b;
-        //ppu->output->set_pixel(ppu->output->data, x, ppu->scanline, pixel);
-        //nes_log("x:%d y:%d c:%x tile:%d attr:%d \n", x, ppu->scanline, pixel, ppu->tile, ppu->attribute);
-    }
 }
 
 /*
@@ -1416,13 +1410,13 @@ void ppu_produce_bg_pixel(ppu_t * ppu)
  * -1/261 是预扫描行
  *  0-239 可见行
  *  240 后扫描行
- *  241-261/-1 垂直同步(扫描枪头从底部返回顶部）
+ *  241-261 垂直同步(扫描枪头从底部返回顶部）
  */
 void ppu_clock(ppu_t * ppu)
 {
     uint16_t v = ppu->v;
     /* pre-scanline */
-    if (ppu->scanline == -1 && ppu->cycles == 1) {
+    if (ppu->scanline == 261 && ppu->cycles == 0) {
         bit_clr(&ppu->reg_status, V_BLANK);
         nes_log("v blank\n");
         /* 257 复制水平位置相关的bits */
@@ -1432,9 +1426,9 @@ void ppu_clock(ppu_t * ppu)
     }
     
 
-    if (0 && ppu->cycles >= 1 && ppu->cycles <= 256 ) {
+    if (ppu->cycles >= 1 && ppu->cycles <= 256 ) {
         /* 4次访存 每次2 周期 */
-        switch((ppu->cycles-1)% 8) {
+        switch((ppu->cycles)% 8) {
             /* 
              * v = NN YYYYY XXXXX
              * NN 最低位是第 10 位，1<<10 = 2^10 = 1024 正好是一个nametable大小
@@ -1443,16 +1437,13 @@ void ppu_clock(ppu_t * ppu)
              * https://www.nesdev.org/wiki/PPU_scrolling#Wrapping_around
              * Tile and attribute fetching
              */
-            case 0: ppu->tile = bus_read(ppu->bus, 0x2000 | (v & 0x0fff)); break;
-            case 2: ppu->attribute = bus_read(ppu->bus, 0x2300 | (v & 0x0C00) | ((v >> 4) & 0x38) | ((v >> 2) & 0x07)); break;
-            case 4: ppu->pattern_0 = bus_read(ppu->bus, 0x1000 * bit_get(&ppu->reg_ctrl, 4) + ppu->tile * 0x10); break;
-            case 6: 
-                    ppu->pattern_1 = bus_read(ppu->bus, 0x1000 * bit_get(&ppu->reg_ctrl, 4) + ppu->tile * 0x10 + 8); 
-                    break;
+            case 2: ppu->nt = bus_read(ppu->bus, 0x2000 | (v & 0x0fff)); break;
+            case 4: ppu->at = bus_read(ppu->bus, 0x2300 | (v & 0x0C00) | ((v >> 4) & 0x38) | ((v >> 2) & 0x07)); break;
+            case 6: ppu->pattern_0 = bus_read(ppu->bus, 0x1000 * bit_get(&ppu->reg_ctrl, 4) + ppu->nt * 0x10); break;
+            case 8: ppu->pattern_1 = bus_read(ppu->bus, 0x1000 * bit_get(&ppu->reg_ctrl, 4) + ppu->nt* 0x10 + 8); break;
         }
         /* visible scanline */
-        if (ppu->scanline >=0 && ppu->scanline <= 239 && ((ppu->cycles)%8 == 0)) {
-            ppu_produce_bg_pixel(ppu);
+        if (ppu->scanline >= 0 && ppu->scanline <= 239 && ((ppu->cycles)%8 == 0)) {
             if ((v & 0x001F) == 31){ // if coarse X == 31
                 v &= ~0x001F;          // coarse X = 0
                 v ^= 0x0400;           // switch horizontal nametable
@@ -1496,14 +1487,9 @@ void ppu_clock(ppu_t * ppu)
     }
 
     /* 261 * 340 cycles wrap */
-    ppu->cycles ++;
-    if (ppu->cycles == 340) {
-        ppu->scanline ++;
-        ppu->cycles = 0;
-
-        if (ppu->scanline == 261) {
-            ppu->scanline = -1;
-        }
+    ppu->cycles  = (ppu->cycles + 1)%341;
+    if (ppu->cycles == 0) {
+        ppu->scanline = (ppu->scanline + 1)%262; 
     }
 }
 
@@ -1568,8 +1554,7 @@ void nes_set_rom(nes_t * nes, rom_t * rom)
 
     bus_mount(nes->cpu->bus, 0x4020, 0xffff, nes->cpu_mapper);
     bus_mount(nes->ppu->bus, 0x0000, 0x1fff, nes->ppu_mapper);
-    ppu_show_pattern_table(nes->ppu, 0);
-    nes_log("%\n");
+    //ppu_show_pattern_table(nes->ppu, 0);
     ppu_show_pattern_table(nes->ppu, 1);
     cpu_interupt(nes->cpu, RESET);
 }
@@ -1605,7 +1590,7 @@ sdl_ouput_t * sdl_ouput_create(uint16_t weight, uint16_t height)
 {
     sdl_ouput_t * sdl_ouput = (sdl_ouput_t*)malloc(sizeof(sdl_ouput_t));
     sdl_ouput->window = SDL_CreateWindow("nes", weight*3, height * 3, 0);
-    sdl_ouput->renderer = SDL_CreateRenderer(sdl_ouput->window, NULL, 0);
+    sdl_ouput->renderer = SDL_CreateRenderer(sdl_ouput->window, NULL); 
     sdl_ouput->texture = SDL_CreateTexture(sdl_ouput->renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, weight, height);
     sdl_ouput->pixels = (uint32_t*)malloc(4*weight*height);
     sdl_ouput->weight = weight;
@@ -1629,11 +1614,9 @@ void sdl_ouput_destroy(sdl_ouput_t * sdl_ouput)
 void sdl_ouput_set_pixel(sdl_ouput_t * sdl_ouput, uint16_t x, uint16_t y, uint32_t pixel)
 {
     sdl_ouput->pixels[y * sdl_ouput->weight + x] = pixel | 0xff000000;
-    if (y == sdl_ouput->height -1 && x == sdl_ouput->weight -1) {
-        SDL_UpdateTexture(sdl_ouput->texture, NULL, sdl_ouput->pixels, sizeof(pixel) * sdl_ouput->weight);
-        SDL_RenderTexture(sdl_ouput->renderer, sdl_ouput->texture, NULL, NULL);
-        SDL_RenderPresent(sdl_ouput->renderer);
-    }
+    SDL_UpdateTexture(sdl_ouput->texture, NULL, sdl_ouput->pixels, sizeof(pixel) * sdl_ouput->weight);
+    SDL_RenderTexture(sdl_ouput->renderer, sdl_ouput->texture, NULL, NULL);
+    SDL_RenderPresent(sdl_ouput->renderer);
 }
 
 /*
@@ -1642,7 +1625,7 @@ void sdl_ouput_set_pixel(sdl_ouput_t * sdl_ouput, uint16_t x, uint16_t y, uint32
 
 int main(int argc, char * argv[]) 
 {
-    //SDL_Init(SDL_INIT_VIDEO);
+    SDL_Init(SDL_INIT_VIDEO);
 
     char * rom_path = "../rom/aa.nes";
     rom_t * rom = rom_load(rom_path);
