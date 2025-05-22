@@ -11,6 +11,7 @@
 
 
 #include <SDL3/SDL.h>
+#include <SDL3_ttf/SDL_ttf.h>
 
 #include "rom.h"
 #include "log.h"
@@ -1326,17 +1327,12 @@ void ppu_power_up(ppu_t * ppu)
     ppu->cycles = 0;
 }
 
-void ppu_show_pattern_table(ppu_t * ppu, uint8_t id)
+void ppu_show_pattern_table(ppu_t * ppu, SDL_Renderer * renderer, int id, int x, int y)
 {
-
-    SDL_Window * window = SDL_CreateWindow("pattern", 256, 256, SDL_WINDOW_OPENGL);
-
-    SDL_Renderer * renderer = SDL_CreateRenderer(window, NULL);
     SDL_Texture * renderBuffer = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_XRGB8888, SDL_TEXTUREACCESS_STREAMING, 128, 128);
     SDL_SetTextureScaleMode(renderBuffer, SDL_SCALEMODE_NEAREST);
 
-
-    uint32_t color[] = {0xffffffff, 0xaaaaaaaa, 0x88888888, 0x0};
+    uint32_t color[] = {0xffff0000, 0xff00ff00, 0xff0000ff, 0x0};
     uint32_t pixels [128*128] = {0};
     uint8_t pattern[128*128] = {0};
 
@@ -1364,9 +1360,9 @@ void ppu_show_pattern_table(ppu_t * ppu, uint8_t id)
         nes_log("\n");
     }
     SDL_UpdateTexture(renderBuffer, NULL, pixels, 4*128);
-    SDL_RenderTexture(renderer, renderBuffer, NULL, NULL);
-    SDL_RenderPresent(renderer);
-    SDL_ShowWindow(window);
+    SDL_FRect dst = {x, y, 256, 256};
+    SDL_RenderTexture(renderer, renderBuffer, NULL, &dst);
+    SDL_DestroyTexture(renderBuffer);
 }
 
 void ppu_show_nametable(ppu_t * ppu)
@@ -1491,6 +1487,7 @@ void ppu_clock(ppu_t * ppu)
     if (ppu->cycles == 0) {
         ppu->scanline = (ppu->scanline + 1)%262; 
     }
+
 }
 
 
@@ -1554,8 +1551,6 @@ void nes_set_rom(nes_t * nes, rom_t * rom)
 
     bus_mount(nes->cpu->bus, 0x4020, 0xffff, nes->cpu_mapper);
     bus_mount(nes->ppu->bus, 0x0000, 0x1fff, nes->ppu_mapper);
-    //ppu_show_pattern_table(nes->ppu, 0);
-    ppu_show_pattern_table(nes->ppu, 1);
     cpu_interupt(nes->cpu, RESET);
 }
 
@@ -1578,56 +1573,37 @@ void nes_set_output(nes_t * nes, output_t * output_device)
 }
 
 typedef struct {
-    SDL_Window * window;
-    SDL_Renderer * renderer;
-    SDL_Texture * texture;
     uint32_t * pixels;
     uint16_t weight;
     uint16_t height;
-}sdl_ouput_t;
+}sdl_output_t;
 
-sdl_ouput_t * sdl_ouput_create(uint16_t weight, uint16_t height)
+sdl_output_t * sdl_output_create(uint16_t weight, uint16_t height)
 {
-    sdl_ouput_t * sdl_ouput = (sdl_ouput_t*)malloc(sizeof(sdl_ouput_t));
-    sdl_ouput->window = SDL_CreateWindow("nes", weight*3, height * 3, 0);
-    sdl_ouput->renderer = SDL_CreateRenderer(sdl_ouput->window, NULL); 
-    sdl_ouput->texture = SDL_CreateTexture(sdl_ouput->renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, weight, height);
-    sdl_ouput->pixels = (uint32_t*)malloc(4*weight*height);
-    sdl_ouput->weight = weight;
-    sdl_ouput->height = height;
-
-    SDL_SetTextureScaleMode(sdl_ouput->texture, SDL_SCALEMODE_NEAREST);
-    SDL_ShowWindow(sdl_ouput->window);
-    return sdl_ouput;
+    sdl_output_t * sdl_output = (sdl_output_t*)malloc(sizeof(sdl_output_t));
+    return sdl_output;
 }
 
-void sdl_ouput_destroy(sdl_ouput_t * sdl_ouput)
+void sdl_output_destroy(sdl_output_t * sdl_output)
 {
-    SDL_DestroyWindow(sdl_ouput->window);
-    SDL_DestroyRenderer(sdl_ouput->renderer);
-    SDL_DestroyTexture(sdl_ouput->texture);
-    free(sdl_ouput->pixels);
+    free(sdl_output->pixels);
 
-    free(sdl_ouput);
+    free(sdl_output);
 }
 
-void sdl_ouput_set_pixel(sdl_ouput_t * sdl_ouput, uint16_t x, uint16_t y, uint32_t pixel)
+void sdl_output_set_pixel(sdl_output_t * sdl_output, uint16_t x, uint16_t y, uint32_t pixel)
 {
-    sdl_ouput->pixels[y * sdl_ouput->weight + x] = pixel | 0xff000000;
-    SDL_UpdateTexture(sdl_ouput->texture, NULL, sdl_ouput->pixels, sizeof(pixel) * sdl_ouput->weight);
-    SDL_RenderTexture(sdl_ouput->renderer, sdl_ouput->texture, NULL, NULL);
-    SDL_RenderPresent(sdl_ouput->renderer);
+    sdl_output->pixels[y * sdl_output->weight + x] = pixel | 0xff000000;
+    //SDL_UpdateTexture(sdl_output->texture, NULL, sdl_output->pixels, sizeof(pixel) * sdl_output->weight);
+    //SDL_RenderTexture(sdl_output->renderer, sdl_output->texture, NULL, NULL);
 }
 
 /*
  * https://austinmorlan.com/posts/nes_rendering_overview/
  */
 
-int main(int argc, char * argv[]) 
+void run_nes(char * rom_path) 
 {
-    SDL_Init(SDL_INIT_VIDEO);
-
-    char * rom_path = "../rom/aa.nes";
     rom_t * rom = rom_load(rom_path);
     if (!rom) {
         nes_log("load rom failed\n");
@@ -1635,8 +1611,8 @@ int main(int argc, char * argv[])
 
     nes_t * nes = nes_create();
     nes_set_logfile("nes.log");
-    sdl_ouput_t * sdl_ouput = sdl_ouput_create(256, 240);
-    output_t * output = output_create(sdl_ouput, (set_pixel_t)sdl_ouput_set_pixel);
+    sdl_output_t * sdl_output = sdl_output_create(256, 240);
+    output_t * output = output_create(sdl_output, (set_pixel_t)sdl_output_set_pixel);
     nes_set_output(nes, output);
     nes_power_up(nes);
     nes_set_rom(nes, rom);
@@ -1654,10 +1630,84 @@ int main(int argc, char * argv[])
     }
 
     rom_destroy(rom);
-    sdl_ouput_destroy(sdl_ouput);
+    sdl_output_destroy(sdl_output);
+    device_destroy(output);
+    nes_destroy(nes);
+}
+
+
+
+void show_text(SDL_Renderer * renderer, TTF_Font * font, int x, int y, char * text) 
+{
+    SDL_Color color = {255, 255, 255, 0}; 
+    SDL_Surface * surf = TTF_RenderText_Blended(font, text, 0, color);
+    SDL_Texture * texture = SDL_CreateTextureFromSurface(renderer, surf);
+    SDL_SetTextureScaleMode(texture, SDL_SCALEMODE_NEAREST);
+
+    SDL_FRect dst = {x, y, texture->w, texture->h};
+    SDL_RenderTexture(renderer, texture, NULL, &dst);
+    SDL_DestroySurface(surf);
+    SDL_DestroyTexture(texture);
+    //SDL_RenderPresent(renderer);
+
+}
+
+int main(int argc, char * argv[]) 
+{
+    SDL_Init(SDL_INIT_VIDEO);
+    int ret = TTF_Init();
+    printf("ret %d\n", ret);
+
+    //run_nes("../rom/aa.nes")
+
+    int w = 512, h = 480+256;
+    SDL_Window * window = SDL_CreateWindow("nes", w, h, 0);
+    SDL_Renderer * renderer = SDL_CreateRenderer(window, NULL); 
+    TTF_Font *font = TTF_OpenFont("../fonts/PixelifySans-Regular.ttf", 30); 
+    SDL_ShowWindow(window);
+
+
+    char * rom_path = "../rom/aa.nes";
+    rom_t * rom = rom_load(rom_path);
+
+    nes_t * nes = nes_create();
+    nes_set_logfile("nes.log");
+    sdl_output_t * sdl_output = sdl_output_create(256, 240);
+    output_t * output = output_create(sdl_output, (set_pixel_t)sdl_output_set_pixel);
+    nes_set_output(nes, output);
+    nes_power_up(nes);
+    nes_set_rom(nes, rom);
+
+
+    SDL_Event event;
+    int app_quit = 0;
+    while (!app_quit) {
+        while (SDL_PollEvent(&event)) {
+            if (event.type == SDL_EVENT_QUIT)
+                app_quit = 1;
+            break;
+        }
+        nes_clock(nes);
+        SDL_SetRenderDrawColor(renderer, 0x0, 0, 0x0, 255);
+        SDL_RenderClear(renderer);
+        //show_text(renderer, font, 100, 100, "hello");
+
+        ppu_show_pattern_table(nes->ppu, renderer, 0, w-512, h-256);
+        ppu_show_pattern_table(nes->ppu, renderer, 1, w-256, h-256);
+        SDL_RenderPresent(renderer);
+        
+        SDL_Delay(16); 
+    }
+
+
+    rom_destroy(rom);
+    sdl_output_destroy(sdl_output);
     device_destroy(output);
     nes_destroy(nes);
 
+    SDL_DestroyWindow(window);
+    TTF_CloseFont(font);
+    TTF_Quit();
     SDL_Quit();
     return 0;
 }
