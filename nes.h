@@ -16,7 +16,7 @@ static inline void bit_clr(uint8_t * byte, uint8_t bit)
     *byte &= ~(1<<bit);
 }
 
-static inline void bit_setv(uint8_t * byte, uint8_t bit, uint8_t v)
+static inline void bit_v_set(uint8_t * byte, uint8_t bit, uint8_t v)
 {
     if (v) bit_set(byte, bit);
     else bit_clr(byte, bit);

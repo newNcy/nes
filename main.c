@@ -16,10 +16,17 @@
 #include "rom.h"
 #include "log.h"
 #include "mapper.h"
+#include <time.h>
 
 #ifdef I
 #undef I
 #endif
+
+uint64_t time_ns() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts); // or CLOCK_REALTIME
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
 
 typedef void (*device_io_t)(void * device, uint16_t address, uint8_t * data, uint8_t is_write);
 
@@ -80,17 +87,21 @@ void cpu_debug_stack_frame_destroy(cpu_debug_stack_frame_t * frame)
     free(frame);
 }
 
-void cpu_debug_stack_frame_unwind(cpu_debug_stack_frame_t * frame)
+void cpu_debug_stack_frame_unwind(cpu_debug_stack_frame_t * frame, char * buff)
 {
     if (!frame) {
         return;
     }
-    cpu_debug_stack_frame_unwind(frame->last);
+    cpu_debug_stack_frame_unwind(frame->last, buff);
     if (frame->last) {
-        nes_log("...%x", frame->return_address);
-        nes_log(">>");
+        char tmp[50] = {0};
+        sprintf(tmp, "...%04X>>", frame->return_address);
+        strcat(buff,tmp);
     }
-    nes_log("%x", frame->address);
+    char tmp[50] = {0};
+    sprintf(tmp, "%04X", frame->address);
+
+    strcat(buff, tmp);
 }
 
 /* https://www.nesdev.org/wiki/CPU_unofficial_opcodes */
@@ -465,8 +476,9 @@ typedef struct {
     uint16_t cycles;
     bus_t * bus;
     device_t * ram;
-    uint8_t inst;
+    inst_t * inst;
     uint16_t inst_addr;
+    uint16_t base;
     uint16_t abs;
     int8_t rel;
     uint32_t debug_ins_count;
@@ -552,9 +564,6 @@ typedef enum {
     SPRITE_OVERFLOW = 5, SPRITE_0_HINT, V_BLANK,
 }ppu_status_bit_t;
 
-typedef enum {
-    ADDR_INC,
-}ppu_control_bit_t;
 
 typedef struct 
 {
@@ -565,15 +574,20 @@ typedef struct
 }object_attribute_t;
 
 typedef struct {
+    uint8_t vram_addr_inc;
+    uint16_t base_nametable_addrress;
+    uint16_t sprite_pattern_table_address;
+    uint16_t background_pattern_table_address;
+    uint8_t sprite_size;
+    uint8_t v_blank_nmi;
     uint16_t v, t;
     uint8_t x, w; // v, t, x, w for scroll and ppu vram accessing
-    uint8_t reg_ctrl;
     uint8_t reg_mask;
     uint8_t reg_status;
     uint8_t reg_oam_addr;
     uint8_t reg_oam_data;
     uint8_t reg_scroll;
-    uint8_t reg_ppu_addr;
+    uint16_t reg_ppu_addr;
     uint8_t reg_ppu_data;
     uint8_t reg_oam_dma;
     uint8_t nmi;
@@ -657,14 +671,20 @@ void bus_mount(bus_t * bus, uint16_t start, uint16_t end, device_t * device)
 
 void bus_io(bus_t * bus, uint16_t address, uint8_t * data, uint8_t is_write) {
     bus_device_t * mount = bus->devices;
+    int found = 0;
     while (mount) {
         if (mount->start <= address && address <= mount->end && mount->device) {
             uint16_t offset = address - mount->start;
             mount->device->io(mount->device->data, offset, data, is_write);
+            found = 1;
             break;
         }
 
         mount = mount->next;
+    }
+
+    if (!found) {
+        printf("bus io to address %04X failed\n", address);
     }
 }
 
@@ -739,7 +759,7 @@ void output_destroy(output_t * output)
 cpu_t * cpu_create()
 {
     cpu_t * cpu = (cpu_t*)malloc(sizeof(cpu_t));
-    memset(cpu, 0, sizeof(cpu));
+    memset(cpu, 0, sizeof(cpu_t));
     cpu->ram = memory_device_create(0x800);
     cpu->bus = bus_create();
     cpu->debug_call_stack = NULL;
@@ -773,7 +793,9 @@ void cpu_stack_push2(cpu_t * cpu, uint16_t byte)
 
 uint8_t cpu_stack_pop(cpu_t * cpu)
 {
-    return bus_read(cpu->bus, 0x100 + ++ cpu->s); 
+    cpu->s ++;
+    uint8_t byte = bus_read(cpu->bus, 0x100 + cpu->s);
+    return byte;
 }
 
 uint16_t cpu_stack_pop2(cpu_t * cpu)
@@ -797,7 +819,7 @@ void cpu_power_up(cpu_t * cpu)
     cpu->a = 0;
     cpu->x = 0;
     cpu->y = 0;
-    cpu->s = 0xFD;
+    cpu->s = 0xFF;
     cpu->debug_ins_count = 0;
     bus_write(cpu->bus, 0x4017, 0);
     bus_write(cpu->bus, 0x4015, 0);
@@ -814,7 +836,7 @@ void cpu_interupt(cpu_t * cpu, cpu_int_t i)
     if (i == IRQ && bit_get(&cpu->p,I)) {
         return;
     }
-    nes_log("cpu_interupt %d\n", i);
+    printf("cpu_interupt %d\n", i);
 
     bit_set(&cpu->p, I);
     uint16_t vector = 0xfffa + i * 2;
@@ -842,10 +864,6 @@ static inline uint8_t cpu_fetch_data(cpu_t * cpu)
 
 static inline void cpu_write_data(cpu_t * cpu, uint8_t data)
 {
-    if (cpu->abs == 0x2007 && data) {
-        nes_log("write none zero to nt addr:%x data:%x\n", cpu->abs, data);
-        getchar();
-    }
     bus_write(cpu->bus, cpu->abs, data);
 }
 
@@ -856,45 +874,40 @@ uint8_t cpu_fetch_inst(cpu_t * cpu)
 {
     cpu->inst_addr = cpu->pc;
 
-    cpu->inst = cpu_fetch(cpu);
-    inst_t * inst = inst_map + cpu->inst;
+    uint8_t inst_code = cpu_fetch(cpu);
+    inst_t * inst = cpu->inst = &inst_map[inst_code];
     cpu->cycles += inst->cycles;
-    if (inst->am == IMP) {
-        /* 这样可以让某些不带操作数视为对A寄存器操作的指令通过cpu_fetch_data/write_data 操作*/
-        cpu->abs = &cpu->a - (uint8_t*)cpu->ram->data;
-    }else if (inst->am == IMM) {
+    if (inst->am == IMM) {
         cpu->abs = cpu->pc;
         cpu->pc ++;
     }else if (inst->am == ZP) {
         uint8_t zp = cpu_fetch(cpu);
         cpu->abs = zp;
     }else if (inst->am == ZPX) {
-        uint16_t zp = cpu_fetch(cpu);
-        cpu->abs = zp + cpu->x;
+        cpu->base = cpu_fetch(cpu);
+        cpu->abs = cpu->base + cpu->x;
     }else if (inst->am == ZPY) {
-        uint16_t zp = cpu_fetch(cpu);
-        cpu->abs = zp + cpu->y;
+        cpu->base = cpu_fetch(cpu);
+        cpu->abs = cpu->base + cpu->y;
     }else if (inst->am == IZX) {
-        uint8_t z = cpu_fetch(cpu);
-        uint16_t ptr = bus_read2(cpu->bus, z + cpu->x); 
-        cpu->abs = ptr;
+        cpu->base = cpu_fetch(cpu);
+        cpu->abs = bus_read2(cpu->bus, cpu->base + cpu->x); 
     }else if (inst->am == IZY) {
-        uint8_t z = cpu_fetch(cpu);
-        uint16_t ptr = bus_read2(cpu->bus, z) + cpu->y; 
+        cpu->base = cpu_fetch(cpu);
+        uint16_t ptr = bus_read2(cpu->bus, cpu->base) + cpu->y; 
         cpu->abs = ptr;
     }else if (inst->am == ABS) {
         uint16_t ptr = cpu_fetch2(cpu);
         cpu->abs = ptr;
     }else if (inst->am == ABX) {
-        uint16_t ptr = cpu_fetch2(cpu);
-        cpu->abs = ptr + cpu->x;
+        cpu->base = cpu_fetch2(cpu);
+        cpu->abs = cpu->base + cpu->x;
     }else if (inst->am == ABY) {
-        uint16_t ptr = cpu_fetch2(cpu);
-        cpu->abs = ptr + cpu->y;
+        cpu->base = cpu_fetch2(cpu);
+        cpu->abs = cpu->base + cpu->y;
     }else if (inst->am == IND) {
-        uint16_t ptr = cpu_fetch2(cpu);
-        nes_log("ptr %x\n", ptr);
-        uint16_t real_ptr = bus_read2(cpu->bus, ptr);
+        cpu->base = cpu_fetch2(cpu);
+        uint16_t real_ptr = bus_read2(cpu->bus, cpu->base);
         cpu->abs = real_ptr;
     }else if (inst->am == REL) {
         cpu->rel = cpu_fetch(cpu);
@@ -905,18 +918,21 @@ uint8_t cpu_fetch_inst(cpu_t * cpu)
 
 static inline void cpu_status_set_zn(cpu_t * cpu, uint8_t res)
 {
-    bit_setv(&cpu->p, Z, res == 0);
-    bit_setv(&cpu->p, N, res & 0x80);
+    bit_v_set(&cpu->p, Z, res == 0);
+    bit_v_set(&cpu->p, N, res & 0x80);
 }
 
-static inline void cpu_status_set_v(cpu_t * cpu, uint8_t operand1, uint8_t operand2, uint16_t res)
+/* 
+ * 设置上下溢出标志 
+ * */
+static inline void cpu_status_set_v(cpu_t * cpu, uint8_t operand1, uint8_t operand2, uint8_t res)
 {
-    bit_setv(&cpu->p, V, (~((operand1&0x80) ^ (operand2&0x80))) & ((res & 0x80) ^ (operand1 & 0x80)));
+    bit_v_set(&cpu->p, V, (~((operand1&0x80) ^ (operand2&0x80))) & ((res & 0x80) ^ (operand1 & 0x80)));
 }
 
 static inline void cpu_status_set_c(cpu_t * cpu, uint16_t res)
 {
-    bit_setv(&cpu->p, C, res > 0xff);
+    bit_v_set(&cpu->p, C, res > 0xff);
 }
 
 void cpu_debug_push_frame(cpu_t * cpu)
@@ -934,23 +950,70 @@ void cpu_debug_pop_frame(cpu_t * cpu)
     }
 }
 
+int cpu_branch(cpu_t * cpu, uint8_t value) {
+    if (value) {
+        cpu->pc = cpu->abs;
+        return 1;
+    }
+    return 0;
+}
+
+int cpu_opps(cpu_t * cpu)
+{
+    addressing_mode_t am = cpu->inst->am;
+    if ((am == ABX || am == ABY) && (0xff00 & cpu->base) != (0xff00&cpu->abs)) {
+        return 1;
+    }
+    return 0;
+}
+void format_inst(cpu_t * cpu, char * buff) 
+{
+    inst_t * inst = cpu->inst;
+    sprintf(buff, "%04X (%02X) %s %s ", cpu->inst_addr, inst - inst_map, inst_tag[inst->t], address_mode_name[inst->am]);
+    char temp[20] = {0};
+    if (inst->am == IMM) {
+        uint8_t data = bus_read(cpu->bus, cpu->abs);
+        sprintf(temp, "#0x%02X(%d)", data, data);
+    }else if (inst->am == ZP || inst->am == ABS) {
+        sprintf(temp, "0x%04X", cpu->abs);
+    }else if (inst->am == ZPX) {
+        sprintf(temp, "0x%04X(0x%02X+%02x)", cpu->abs, cpu->base, cpu->x);
+    }else if (inst->am == ZPY) {
+        sprintf(temp, "0x%04X(0x%02X+%02x)", cpu->abs, cpu->base, cpu->y);
+    }else if (inst->am == IZX) {
+        sprintf(temp, "0x%04X([0x%02X+%02x])", cpu->abs, cpu->base, cpu->x);
+    }else if (inst->am == IZY) {
+        sprintf(temp, "0x%04X([0x%02X]+%02x)", cpu->abs, cpu->base, cpu->y);
+    }else if (inst->am == REL) {
+        sprintf(temp, "%04X (%04X+(%d))", cpu->abs, cpu->pc , cpu->rel);
+    }else if (inst->am == ABX) {
+        sprintf(temp, "0x%04X(0x%04X + %02X)", cpu->abs, cpu->base, cpu->x );
+    } else if (inst->am == ABY) {
+        sprintf(temp, "0x%04X(0x%04X + %02X)", cpu->abs, cpu->base, cpu->y );
+    }else if (inst->am == IND) {
+        sprintf(temp, "0x%04X([0x%04X])", cpu->abs, cpu->base);
+    }
+    strcat(buff, temp);
+}
+
+
+
 /*
  * https://www.oxyron.de/html/opcodes02.html
  */
 uint8_t cpu_exec_single(cpu_t * cpu)
 {
-    inst_t * inst = inst_map + cpu->inst;
+    inst_t * inst = cpu->inst;
     int8_t operand = 0;
     uint16_t res = 0;
+    uint8_t add_cycle = 0;
+
+    char buff[100] = {0};
+    format_inst(cpu, buff);
+    //printf("%s\n", buff);
     switch(inst->t) {
-        case NOP: break;
-        case BMI:
-            cpu->pc = bit_get(&cpu->p, N) ? cpu->abs : cpu->pc;
-            break;
-        case JSR:
-            cpu_debug_push_frame(cpu);
-            cpu_stack_push2(cpu, cpu->pc);
-            cpu->pc = cpu->abs;
+        case NOP: 
+            add_cycle = cpu_opps(cpu);
             break;
         case INC:
             operand = cpu_fetch_data(cpu) + 1;
@@ -967,10 +1030,30 @@ uint8_t cpu_exec_single(cpu_t * cpu)
             cpu_status_set_zn(cpu, cpu->a);
             break;
         case BPL:
-            cpu->pc = (bit_get(&cpu->p, N) == 0)? cpu->abs: cpu->pc;
+            add_cycle = cpu_branch(cpu, bit_get(&cpu->p, N) == 0);
+            break;
+        case BMI:
+            add_cycle = cpu_branch(cpu, bit_get(&cpu->p, N) == 1);
+            break;
+        case BVC:
+            add_cycle = cpu_branch(cpu, bit_get(&cpu->p, V) == 0);
+            break;
+        case BVS:
+            add_cycle = cpu_branch(cpu, bit_get(&cpu->p, V) == 1);
+            break;
+        case BCC:
+            add_cycle = cpu_branch(cpu, bit_get(&cpu->p, C) == 0);
+            break;
+        case BCS:
+            add_cycle = cpu_branch(cpu, bit_get(&cpu->p, C) == 1);
+            break;
+        case BNE:
+            add_cycle = cpu_branch(cpu, bit_get(&cpu->p, Z) == 0);
+            break;
+        case BEQ:
+            add_cycle = cpu_branch(cpu, bit_get(&cpu->p, Z) == 1);
             break;
         case BRK:
-            bit_clr(&cpu->p, I);
             bit_set(&cpu->p, B);
             cpu_interupt(cpu, IRQ);
             break;
@@ -978,15 +1061,53 @@ uint8_t cpu_exec_single(cpu_t * cpu)
             cpu->p = cpu_stack_pop(cpu);
             cpu->pc = cpu_stack_pop2(cpu);
             break;
+        case JSR:
+            cpu_debug_push_frame(cpu);
+            cpu_stack_push2(cpu, cpu->pc);
+            cpu->pc = cpu->abs;
+            break;
         case RTS:
-            cpu->pc = cpu_stack_pop2(cpu);
             cpu_debug_pop_frame(cpu);
+            cpu->pc = cpu_stack_pop2(cpu);
+            break;
+        case JMP:
+            cpu->pc = cpu->abs;
+            break;
+        case BIT:
+            operand = cpu_fetch_data(cpu);
+            bit_v_set(&cpu->p, N, bit_get((uint8_t*)&operand, 7));
+            bit_v_set(&cpu->p, V, bit_get((uint8_t*)&operand, 6));
+            bit_v_set(&cpu->p, Z, (cpu->a & operand) == 0);
+            break;
+        case CLC:
+            bit_clr(&cpu->p, C);
+            break;
+        case SEC:
+            bit_set(&cpu->p, C);
+            break;
+        case CLD:
+            bit_clr(&cpu->p, D);
+            break;
+        case SED:
+            bit_set(&cpu->p, D);
+            break;
+        case CLI:
+            bit_clr(&cpu->p, I);
+            break;
+        case SEI:
+            bit_set(&cpu->p, I);
+            break;
+        case CLV:
+            bit_clr(&cpu->p, I);
             break;
         case STA:
             cpu_write_data(cpu, cpu->a);
             break;
-        case SEI:
-            bit_set(&cpu->p, I);
+        case SLO:
+            operand = cpu_fetch_data(cpu);
+            operand = operand<<1;
+            bit_v_set(&cpu->p, C, operand & 0x80); 
+            cpu_status_set_zn(cpu, operand);
             break;
         case LDX:
             cpu->x = cpu_fetch_data(cpu);
@@ -998,32 +1119,39 @@ uint8_t cpu_exec_single(cpu_t * cpu)
         case TXA:
             cpu->a = cpu->x;
             break;
+        case ORA:
+            operand = cpu->a | cpu_fetch_data(cpu);
+            cpu_status_set_zn(cpu, operand);
+            add_cycle = cpu_opps(cpu);
+            break;
+        case AND:
+            cpu->a &= cpu_fetch_data(cpu);
+            cpu_status_set_zn(cpu, cpu->a);
+            add_cycle = cpu_opps(cpu);
+            break;
+        case EOR:
+            cpu->a = cpu->a ^ cpu_fetch_data(cpu);
+            cpu_status_set_zn(cpu, cpu->a);
+            add_cycle = cpu_opps(cpu);
+            break;
         case CMP:
             operand = cpu->a - cpu_fetch_data(cpu);
-            bit_setv(&cpu->p, C, operand & 0x80); 
+            bit_v_set(&cpu->p, C, operand & 0x80); 
             cpu_status_set_zn(cpu, operand);
             break;
         case CPX:
             operand = cpu->x - cpu_fetch_data(cpu);
-            bit_setv(&cpu->p, C, operand & 0x80); 
+            bit_v_set(&cpu->p, C, operand & 0x80); 
             cpu_status_set_zn(cpu, operand);
             break;
-        case BEQ:
-            cpu->pc = (bit_get(&cpu->p, Z) == 1) ? cpu->abs : cpu->pc;
-            break;
-        case BNE:
-            cpu->pc = (bit_get(&cpu->p, Z) == 0) ? cpu->abs : cpu->pc;
-            break;
-        case BCC:
-            cpu->pc = (bit_get(&cpu->p, C) == 0) ? cpu->abs : cpu->pc;
-            break;
-        case CLC:
-            bit_clr(&cpu->p, C);
+        case CPY:
+            operand = cpu->y - cpu_fetch_data(cpu);
+            bit_v_set(&cpu->p, C, operand & 0x80); 
+            cpu_status_set_zn(cpu, operand);
             break;
         case ADC:
             operand = cpu_fetch_data(cpu);
-            res = cpu->a;
-            res += operand;
+            res = cpu->a + operand + bit_get(&cpu->p, C);
             cpu_status_set_v(cpu, cpu->a, operand, res);
             cpu_status_set_c(cpu, res);
             cpu_status_set_zn(cpu, res);
@@ -1031,8 +1159,7 @@ uint8_t cpu_exec_single(cpu_t * cpu)
             break;
         case SBC:
             operand = cpu_fetch_data(cpu);
-            res = cpu->a;
-            res -= operand;
+            res = cpu->a - operand + bit_get(&cpu->p, C);;
             cpu_status_set_v(cpu, operand, cpu->a, res);
             cpu_status_set_c(cpu, res);
             cpu_status_set_zn(cpu, res);
@@ -1048,7 +1175,7 @@ uint8_t cpu_exec_single(cpu_t * cpu)
             break;
         case LSR:
             operand = cpu_fetch_data(cpu);
-            bit_setv(&cpu->p, C, operand & 0x1);
+            bit_v_set(&cpu->p, C, operand & 0x1);
             operand >>= 1;
             cpu_status_set_zn(cpu, operand);
 
@@ -1056,7 +1183,7 @@ uint8_t cpu_exec_single(cpu_t * cpu)
             break;
         case ROL:
             operand = cpu_fetch_data(cpu);
-            bit_setv(&cpu->p, C, operand& 0x80);
+            bit_v_set(&cpu->p, C, operand& 0x80);
             operand <<= 1 ;
             operand |= bit_get(&cpu->p, C);
             cpu_write_data(cpu, operand);
@@ -1092,9 +1219,6 @@ uint8_t cpu_exec_single(cpu_t * cpu)
             cpu_write_data(cpu, operand);
             cpu_status_set_zn(cpu, cpu->a - operand);
             break;
-        case JMP:
-            cpu->pc = cpu->abs;
-            break;
         case PHA:
             cpu_stack_push(cpu, cpu->a);
             break;
@@ -1105,6 +1229,7 @@ uint8_t cpu_exec_single(cpu_t * cpu)
         case TAX:
             cpu->x = cpu->a;
             cpu_status_set_zn(cpu, cpu->x);
+            break;
         case TAY:
             cpu->y = cpu->a;
             cpu_status_set_zn(cpu, cpu->y);
@@ -1113,21 +1238,19 @@ uint8_t cpu_exec_single(cpu_t * cpu)
             cpu->a = cpu->y;
             cpu_status_set_zn(cpu, cpu->a);
             break;
-        case AND:
-            cpu->a &= cpu_fetch_data(cpu);
-            cpu_status_set_zn(cpu, cpu->a);
-            break;
 
         default:
-            nes_log("unsupported\n");
-            exit(0);
+            printf("unsupported %s\n", inst_tag[inst->t]);
             break;
     }
+
+    cpu->cycles += add_cycle;
+    cpu->inst = NULL;
     return 0;
 }
 
 
-void cpu_debug_dump_stack(cpu_t * cpu)
+void cpu_debug_dump_stack(cpu_t * cpu, char * buff)
 {
     nes_log(" ");
     for (uint16_t addr = 0xfe; addr > cpu->s; -- addr) {
@@ -1149,7 +1272,7 @@ void cpu_debug_show_detail(cpu_t * cpu)
             bit_get(&cpu->p, Z) ? 'Z':'-',
             bit_get(&cpu->p, C) ? 'C':'-'
           );
-    inst_t * inst = inst_map + cpu->inst;
+    inst_t * inst = cpu->inst;
     nes_log("$%04x %02x[%s %s %02x(%d)]", cpu->inst_addr, cpu->inst, inst_tag[inst->t], address_mode_name[inst->am], inst->am == IMP ? 0 : cpu->abs, inst->am == REL ? cpu->rel: 0);
     //cpu_debug_stack_frame_unwind(cpu->debug_call_stack);
     //cpu_debug_dump_stack(cpu);
@@ -1159,20 +1282,14 @@ void cpu_debug_show_detail(cpu_t * cpu)
 void cpu_clock(cpu_t * cpu)
 {
     if (cpu->cycles == 0) {
-
-        cpu->debug_ins_count ++;
-
-        cpu->cycles += cpu_fetch_inst(cpu);
-
-        if (cpu->abs == 0x04) {
-            cpu_debug_show_detail(cpu);
+        if (!cpu->inst) {
+            cpu_fetch_inst(cpu);
+        }else {
+            cpu_exec_single(cpu);
         }
-        cpu->cycles += cpu_exec_single(cpu);
-        if (cpu->abs == 0x04) {
-            cpu_debug_show_detail(cpu);
-        }
+    }else {
+        cpu->cycles --;
     }
-    cpu->cycles --;
 }
 
 void cpu_dump_prg(cpu_t * cpu, uint16_t from, uint8_t count)
@@ -1228,53 +1345,65 @@ static inline uint8_t ppu_vt_get_fine_y(uint16_t * reg)
 
 void ppu_register_io(void * device, uint16_t address, uint8_t * byte, uint8_t is_write) 
 {
+    if (address != 7)
+    printf("ppu register io %0X %02x is_write:%d\n", 0x2000 + address, *byte, is_write);
     ppu_t * ppu = (ppu_t*)device;
 
-    /* reg_oam_data */
-    if (address == 4) {
-        memory_io(ppu->oam, ppu->reg_oam_addr, &ppu->reg_oam_data, is_write);
-        if (is_write) {
-            ppu->reg_oam_addr ++;
-        }
-    }else if (address == 7) {
-        bus_io(ppu->bus, ppu->v, byte, is_write);
-        /* if reg_ctrl bit 2 is 0 then add 1 else add 32 */
-        ppu->v += 1 << (4 * bit_get(&ppu->reg_ctrl, 2));
-    } else {
-        memory_io(&ppu->reg_ctrl, address, byte, is_write);
-    }
 
-    /* read 0x2002 will clear V_BLANK bit and w latch register */
-    if (address == 0 && is_write) {
-        ppu_vt_set_nametable_idx(&ppu->t, ppu->reg_ctrl&0x3);
-        if (bit_get(byte, 7) && bit_get(&ppu->reg_status, V_BLANK)) {
-            ppu->nmi = 1;
+    if (is_write) {
+        switch(address) {
+            case 0: {
+                        ppu->base_nametable_addrress = 0x2000 + 0x400 * (*byte & 0x3);
+                        ppu->vram_addr_inc = 1 + 31*bit_get(byte, 2);
+                        ppu->sprite_pattern_table_address = 0x1000 * bit_get(byte, 3);
+                        ppu->background_pattern_table_address = 0x10000 * bit_get(byte, 4);
+                        ppu->sprite_size = 8 + 8*bit_get(byte, 5);
+                        ppu->v_blank_nmi = bit_get(byte, 7);
+                        if (ppu->v_blank_nmi) {
+                            ppu->nmi = 1;
+                        }
+                    }
+                    break;
+            case 1: ppu->reg_mask = *byte; break;
+            case 3: ppu->reg_oam_addr = *byte; break;
+            case 4: memory_io( ppu->oam, ppu->reg_oam_addr, byte, is_write); ppu->reg_oam_addr ++; break;
+            case 5: 
+                    if (!ppu->w) {
+                        ppu->x = *byte & 0x7;
+                        ppu_vt_set_coarse_x(&ppu->t, ppu->reg_scroll>>3);
+                    }else {
+                        ppu_vt_set_fine_y(&ppu->t, ppu->reg_scroll & 0x7);
+                        ppu_vt_set_coarse_y(&ppu->t, ppu->reg_scroll >> 3);
+                    }
+                    ppu->w = !ppu->w;
+                    break;
+            case 6: 
+                    if (!ppu->w) {
+                        ppu->reg_ppu_addr  = *byte << 8;
+                    }else {
+                        ppu->reg_ppu_addr  = ppu->reg_ppu_addr | *byte;
+                    }
+                    ppu->w = !ppu->w;
+                    break;
+            case 7:
+                    bus_io(ppu->bus, ppu->reg_ppu_addr, byte, is_write);
+                    ppu->reg_ppu_addr += ppu->vram_addr_inc;
+                    break;
         }
-    } else if (!is_write && address == 2) {
-        bit_clr(&ppu->reg_status, V_BLANK);
-        ppu->nmi = 0;
-        ppu->w = 0;
-    } else if (address == 5) {
-        if (!ppu->w) {
-            ppu->x = ppu->reg_scroll & 0x7;
-            ppu_vt_set_coarse_x(&ppu->t, ppu->reg_scroll>>3);
-        }else {
-            ppu_vt_set_fine_y(&ppu->t, ppu->reg_scroll & 0x7);
-            ppu_vt_set_coarse_y(&ppu->t, ppu->reg_scroll >> 3);
+    }else {
+        switch(address) {
+            case 2:
+                *byte = ppu->reg_status;
+                ppu->w = 0;
+                break;
+            case 4:
+                memory_io(ppu->oam, address, byte, is_write);
+                break;
+            case 7:
+                bus_io(ppu->bus, ppu->reg_ppu_addr, byte, is_write);
+                ppu->reg_ppu_addr += ppu->vram_addr_inc;
+                break;
         }
-    } else if (address == 6) {
-        if (!ppu->w) {
-            ppu->t = ppu->reg_ppu_addr & 0x7f;
-            ppu->t <<= 8;
-        }else {
-            ppu->t |= ppu->reg_ppu_addr;
-            ppu->v = ppu->t;
-        }
-    } 
-
-    /* w latch register shared between reg_ppu_addr and reg_scroll*/
-    if (is_write && (address == 5 || address == 6)) {
-        ppu->w ^= 1;
     }
 }
 
@@ -1306,7 +1435,7 @@ ppu_t * ppu_create()
     return ppu;
 }
 
-void * ppu_destroy(ppu_t * ppu) 
+void ppu_destroy(ppu_t * ppu) 
 {
     bus_destroy(ppu->bus);
     memory_device_destroy(ppu->paletters);
@@ -1320,14 +1449,13 @@ void ppu_power_up(ppu_t * ppu)
 {
     ppu->reg_status = 0;
     bit_set(&ppu->reg_status, V_BLANK);
-    ppu->reg_ctrl = 0;
     ppu->reg_mask = 0;
 
     ppu->scanline = 261;
     ppu->cycles = 0;
 }
 
-void ppu_show_pattern_table(ppu_t * ppu, SDL_Renderer * renderer, int id, int x, int y)
+SDL_Texture * create_pattern_table_texture(ppu_t * ppu, SDL_Renderer * renderer, int id)
 {
     SDL_Texture * renderBuffer = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_XRGB8888, SDL_TEXTUREACCESS_STREAMING, 128, 128);
     SDL_SetTextureScaleMode(renderBuffer, SDL_SCALEMODE_NEAREST);
@@ -1353,16 +1481,8 @@ void ppu_show_pattern_table(ppu_t * ppu, SDL_Renderer * renderer, int id, int x,
         }
     }
 
-    for (int i = 0; i < 128; ++ i) {
-        for (int j = 0; j < 128; ++ j) {
-            nes_log("%d", pattern[i*128+j]);
-        }
-        nes_log("\n");
-    }
     SDL_UpdateTexture(renderBuffer, NULL, pixels, 4*128);
-    SDL_FRect dst = {x, y, 256, 256};
-    SDL_RenderTexture(renderer, renderBuffer, NULL, &dst);
-    SDL_DestroyTexture(renderBuffer);
+    return renderBuffer;
 }
 
 void ppu_show_nametable(ppu_t * ppu)
@@ -1414,7 +1534,7 @@ void ppu_clock(ppu_t * ppu)
     /* pre-scanline */
     if (ppu->scanline == 261 && ppu->cycles == 0) {
         bit_clr(&ppu->reg_status, V_BLANK);
-        nes_log("v blank\n");
+        printf("clear v blank\n");
         /* 257 复制水平位置相关的bits */
         if (ppu->cycles >= 280 && ppu->cycles <= 304) {
             v |= ppu->t & 0x7be0;
@@ -1435,8 +1555,8 @@ void ppu_clock(ppu_t * ppu)
              */
             case 2: ppu->nt = bus_read(ppu->bus, 0x2000 | (v & 0x0fff)); break;
             case 4: ppu->at = bus_read(ppu->bus, 0x2300 | (v & 0x0C00) | ((v >> 4) & 0x38) | ((v >> 2) & 0x07)); break;
-            case 6: ppu->pattern_0 = bus_read(ppu->bus, 0x1000 * bit_get(&ppu->reg_ctrl, 4) + ppu->nt * 0x10); break;
-            case 8: ppu->pattern_1 = bus_read(ppu->bus, 0x1000 * bit_get(&ppu->reg_ctrl, 4) + ppu->nt* 0x10 + 8); break;
+            case 6: ppu->pattern_0 = bus_read(ppu->bus, ppu->background_pattern_table_address  + ppu->nt * 0x10); break;
+            case 8: ppu->pattern_1 = bus_read(ppu->bus, ppu->background_pattern_table_address  + ppu->nt* 0x10 + 8); break;
         }
         /* visible scanline */
         if (ppu->scanline >= 0 && ppu->scanline <= 239 && ((ppu->cycles)%8 == 0)) {
@@ -1477,7 +1597,8 @@ void ppu_clock(ppu_t * ppu)
     /* vertical blank*/
     if (ppu->scanline == 241 && ppu->cycles == 1) {
         bit_set(&ppu->reg_status, V_BLANK);
-        if (bit_get(&ppu->reg_ctrl, 7)) {
+        printf("set v blank\n");
+        if (ppu->v_blank_nmi) {
             ppu->nmi = 1;
         }
     }
@@ -1532,6 +1653,65 @@ void nes_power_up(nes_t * nes)
     ppu_power_up(nes->ppu);
 }
 
+
+void nes_clock(nes_t * nes)
+{
+    cpu_clock(nes->cpu);
+    for (int i = 0; i < 3; ++ i) {
+        ppu_clock(nes->ppu);
+        if (nes->ppu->nmi) {
+            cpu_interupt(nes->cpu, NMI);
+            nes->ppu->nmi = 0;
+        }
+    }
+}
+
+void nes_until_inst(nes_t * nes) 
+{
+    while (!nes->cpu->inst) {
+        nes_clock(nes);
+    }
+}
+
+void nes_until_exec(nes_t * nes) 
+{
+    int clock = 0;
+    char buff[100] = {0};
+    while (nes->cpu->inst) {
+        nes_clock(nes);
+        clock ++;
+    }
+}
+
+void nes_step(nes_t * nes)
+{
+    assert(nes->cpu->inst);
+    nes_until_exec(nes);
+    nes_until_inst(nes);
+}
+
+void nes_line(nes_t * nes) {
+    int line = nes->ppu->scanline;
+    while (line == nes->ppu->scanline) {
+        nes_clock(nes);
+    }
+}
+void nes_frame(nes_t * nes) {
+    int line = nes->ppu->scanline;
+    do {
+        nes_clock(nes);
+    }while(nes->ppu->scanline == line);
+    do {
+        nes_clock(nes);
+    }while(nes->ppu->scanline != line);
+}
+
+void nes_reset(nes_t * nes) 
+{
+    cpu_interupt(nes->cpu, RESET);
+    nes_until_inst(nes);
+}
+
 void nes_set_rom(nes_t * nes, rom_t * rom)
 {
     if (nes->cpu_mapper) {
@@ -1551,21 +1731,10 @@ void nes_set_rom(nes_t * nes, rom_t * rom)
 
     bus_mount(nes->cpu->bus, 0x4020, 0xffff, nes->cpu_mapper);
     bus_mount(nes->ppu->bus, 0x0000, 0x1fff, nes->ppu_mapper);
-    cpu_interupt(nes->cpu, RESET);
+
+    nes_reset(nes);
 }
 
-
-void nes_clock(nes_t * nes)
-{
-    cpu_clock(nes->cpu);
-    for (int i = 0; i < 3; ++ i) {
-        ppu_clock(nes->ppu);
-        if (nes->ppu->nmi) {
-            cpu_interupt(nes->cpu, NMI);
-            nes->ppu->nmi = 0;
-        }
-    }
-}
 
 void nes_set_output(nes_t * nes, output_t * output_device)
 {
@@ -1601,45 +1770,8 @@ void sdl_output_set_pixel(sdl_output_t * sdl_output, uint16_t x, uint16_t y, uin
 /*
  * https://austinmorlan.com/posts/nes_rendering_overview/
  */
-
-void run_nes(char * rom_path) 
+void show_text(SDL_Renderer * renderer, TTF_Font * font, int x, int y, SDL_Color color, char * text) 
 {
-    rom_t * rom = rom_load(rom_path);
-    if (!rom) {
-        nes_log("load rom failed\n");
-    }
-
-    nes_t * nes = nes_create();
-    nes_set_logfile("nes.log");
-    sdl_output_t * sdl_output = sdl_output_create(256, 240);
-    output_t * output = output_create(sdl_output, (set_pixel_t)sdl_output_set_pixel);
-    nes_set_output(nes, output);
-    nes_power_up(nes);
-    nes_set_rom(nes, rom);
-
-
-    SDL_Event event;
-    int app_quit = 0;
-    while (!app_quit) {
-        nes_clock(nes);
-        while (SDL_PollEvent(&event)) {
-            if (event.type == SDL_EVENT_QUIT)
-                app_quit = 1;
-            break;
-        }
-    }
-
-    rom_destroy(rom);
-    sdl_output_destroy(sdl_output);
-    device_destroy(output);
-    nes_destroy(nes);
-}
-
-
-
-void show_text(SDL_Renderer * renderer, TTF_Font * font, int x, int y, char * text) 
-{
-    SDL_Color color = {255, 255, 255, 0}; 
     SDL_Surface * surf = TTF_RenderText_Blended(font, text, 0, color);
     SDL_Texture * texture = SDL_CreateTextureFromSurface(renderer, surf);
     SDL_SetTextureScaleMode(texture, SDL_SCALEMODE_NEAREST);
@@ -1649,8 +1781,159 @@ void show_text(SDL_Renderer * renderer, TTF_Font * font, int x, int y, char * te
     SDL_DestroySurface(surf);
     SDL_DestroyTexture(texture);
     //SDL_RenderPresent(renderer);
-
 }
+
+typedef struct 
+{
+    nes_t * nes_ref;
+    SDL_Texture * pattern_0;
+    SDL_Texture * pattern_1;
+    TTF_Font * font_ref;
+    SDL_Color white, gray;
+    int p0_x, p0_y;
+    int p1_x, p1_y;
+    int zp_x, zp_y;
+    int p_x, p_y;
+    int s_x, s_y;
+    int pp_x, pp_y;
+    int mem_page;
+}debug_info_t;
+
+debug_info_t * create_debug_info(nes_t * nes, SDL_Renderer * renderer)
+{
+    debug_info_t * info = (debug_info_t*)malloc(sizeof(debug_info_t));
+    memset(info, 0, sizeof(debug_info_t));
+    info->pattern_0 = create_pattern_table_texture(nes->ppu, renderer, 0);
+    info->pattern_1 = create_pattern_table_texture(nes->ppu, renderer, 1);
+    info->nes_ref = nes;
+    return info;
+}
+
+void destroy_debug_info(debug_info_t * info) 
+{
+    SDL_DestroyTexture(info->pattern_0);
+    SDL_DestroyTexture(info->pattern_1);
+    free(info);
+}
+
+void debug_show_ram(SDL_Renderer * renderer, TTF_Font * font, cpu_t * cpu, debug_info_t * info) {
+    uint16_t start = info->mem_page * 0x100;
+    uint16_t end = (info->mem_page +1) * 0x100;
+    for (uint16_t b = start; b < end; b += 0x10 ) {
+        char line[1024] = {0};
+        sprintf(line, "%04X", b);
+        for (u_int16_t i = 0x00 ; i<= 0xf ; i ++) {
+            uint8_t byte = bus_read(cpu->bus, b + i);
+            char temp2[4] = {0};
+            sprintf(temp2, " %02X", byte);
+            strcat(line, temp2);
+        }
+        SDL_Color white = {0xff, 0xff, 0xff};
+        show_text(renderer, font, info->zp_x, info->zp_y + (b-start) / 0x10 * 15, white,  line);
+    }
+}
+
+void debug_show_stack(SDL_Renderer * renderer, TTF_Font * font, cpu_t * cpu, int x, int y) 
+{
+    for (uint16_t s = 0xff ; s > cpu->s; -- s) {
+        char line[1024] = {0};
+        uint8_t byte = bus_read(cpu->bus, 0x0100 | s);
+        sprintf(line, "%04X %02X", 0x100|s, byte);
+        SDL_Color white = {0xff, 0xff, 0xff};
+        show_text(renderer, font, x, y + (0xff-s) * 15, white,  line);
+    }
+}
+
+
+
+void debug_show_cpu(SDL_Renderer * renderer, debug_info_t * info) 
+{
+    TTF_Font * font = info->font_ref;
+    cpu_t * cpu = info->nes_ref->cpu;
+    debug_show_ram(renderer, font, cpu, info);
+    debug_show_stack(renderer, font, cpu, 512 + 256 + 320, 0);
+    int x = info->p_x;
+    int y = info->p_y;
+    char buff [256] = {0};
+    sprintf(buff, "A=%02X X=%02X Y=%02X  S=%02X pc=%04X", cpu->a, cpu->x, cpu->y, cpu->s, cpu->pc);
+    SDL_Color white = {0xff, 0xff, 0xff};
+    SDL_Color gray = {0x60, 0x60, 0x60};
+    int space = 15;
+    show_text(renderer, font, x, y, white, buff);
+    show_text(renderer, font, x, y + space, bit_get(&cpu->p, N)? white : gray, "N");
+    show_text(renderer, font, x + 18, y + space, bit_get(&cpu->p, V)? white : gray, "V");
+    show_text(renderer, font, x + 36, y + space, bit_get(&cpu->p, B)? white : gray, "B");
+    show_text(renderer, font, x + 54, y + space, bit_get(&cpu->p, D)? white : gray, "D");
+    show_text(renderer, font, x + 72, y + space, bit_get(&cpu->p, I)? white : gray, "I");
+    show_text(renderer, font, x + 90, y + space, bit_get(&cpu->p, Z)? white : gray, "Z");
+    show_text(renderer, font, x + 108, y + space, bit_get(&cpu->p, C)? white : gray, "C");
+
+    memset(buff, 0, 100);
+    inst_t * inst = cpu->inst;
+    
+    format_inst(cpu, buff);
+    show_text(renderer, font, x, y + 2*space, white, buff);
+
+    for (uint16_t i = 1; i < 5; ++ i) {
+        uint16_t addr = cpu->inst_addr + i;
+        char buff[16] = {0};
+        uint8_t byte = bus_read(cpu->bus, addr);
+        sprintf(buff, "%04X %02X", addr, byte);
+        show_text(renderer, font, x, y + space*(2+i), white, buff);
+    }
+    memset(buff, 0, 100);
+    cpu_debug_stack_frame_unwind(cpu->debug_call_stack, buff);
+    if (strlen(buff)) {
+        show_text(renderer, font, x, y + space*7, white, buff);
+    }
+}
+
+
+
+void debug_show_ppu(SDL_Renderer * renderer, debug_info_t * info) 
+{
+
+    TTF_Font * font = info->font_ref;
+    ppu_t * ppu = info->nes_ref->ppu;
+    SDL_Color white = {0xff, 0xff, 0xff};
+
+    {
+        char buff [100] = {0};
+        sprintf(buff, "scanline=%03d:%03d", ppu->scanline, ppu->cycles);
+        show_text(renderer, info->font_ref, info->pp_x, info->pp_y, white, buff);
+    }
+    {
+        char buff [100] = {0};
+        sprintf(buff, "V=%d VNMI=%d", bit_get(&ppu->reg_status, V_BLANK), ppu->v_blank_nmi);
+        show_text(renderer, info->font_ref, info->pp_x, info->pp_y + 15, white, buff);
+    }
+    {
+        char buff [100] = {0};
+        sprintf(buff, "reg_oam_addr=%02X", ppu->reg_oam_addr);
+        show_text(renderer, info->font_ref, info->pp_x, info->pp_y + 2*15, white, buff);
+    }
+    {
+        char buff [100] = {0};
+        sprintf(buff, "ppu_addr=%04X", ppu->reg_ppu_addr);
+        show_text(renderer, info->font_ref, info->pp_x, info->pp_y + 3*15, white, buff);
+    }
+    {
+        char buff [100] = {0};
+        sprintf(buff, "background_pattern_address=%04X", ppu->background_pattern_table_address);
+        show_text(renderer, info->font_ref, info->pp_x, info->pp_y + 4*15, white, buff);
+    }
+}
+
+void debug_view(debug_info_t * info, SDL_Renderer * renderer) 
+{
+    SDL_FRect p0 = {info->p0_x, info->p0_y, 128, 128};
+    SDL_FRect p1 = {info->p1_x, info->p1_y, 128, 128};
+    SDL_RenderTexture(renderer, info->pattern_0, NULL, &p0);
+    SDL_RenderTexture(renderer, info->pattern_1, NULL, &p1);
+    debug_show_cpu(renderer, info);
+    debug_show_ppu(renderer, info);
+}
+
 
 int main(int argc, char * argv[]) 
 {
@@ -1660,14 +1943,17 @@ int main(int argc, char * argv[])
 
     //run_nes("../rom/aa.nes")
 
-    int w = 512, h = 480+256;
+    int pattern = 128;
+    int zp = 310;
+    int stack = 80;
+    int w = 512 + pattern* 2 + zp + stack, h = 480;
     SDL_Window * window = SDL_CreateWindow("nes", w, h, 0);
     SDL_Renderer * renderer = SDL_CreateRenderer(window, NULL); 
-    TTF_Font *font = TTF_OpenFont("../fonts/PixelifySans-Regular.ttf", 30); 
+    TTF_Font *font = TTF_OpenFont("../fonts/Roboto-Bold.ttf", 12); 
     SDL_ShowWindow(window);
 
 
-    char * rom_path = "../rom/aa.nes";
+    char * rom_path = "../rom/sm.nes";
     rom_t * rom = rom_load(rom_path);
 
     nes_t * nes = nes_create();
@@ -1678,28 +1964,71 @@ int main(int argc, char * argv[])
     nes_power_up(nes);
     nes_set_rom(nes, rom);
 
+    debug_info_t * debug_info  = create_debug_info(nes, renderer);
+    debug_info->font_ref = font;
+    debug_info->white = (SDL_Color){0xff, 0xff, 0xff};
+    debug_info->gray = (SDL_Color){0x60, 0x60, 0x60};
+    debug_info->p0_x = 512;
+    debug_info->p1_x = 512 + 128;
+    debug_info->zp_x = 512 + 256 + 10;
+    debug_info->p_x = 512;
+    debug_info->p_y = 128+128;
+    debug_info->pp_x = 512;
+    debug_info->pp_y = 128;
+
 
     SDL_Event event;
     int app_quit = 0;
+
+    int step = 1;
     while (!app_quit) {
+        uint64_t s = time_ns();
+        SDL_SetRenderDrawColor(renderer, 0x0, 0, 0x0, 255);
+        
+        SDL_RenderClear(renderer);
+
+        cpu_t * cpu = nes->cpu;
+        if (!step) {
+            nes_frame(nes);
+        } 
+        
+        nes_until_inst(nes);
+        debug_view(debug_info, renderer);
         while (SDL_PollEvent(&event)) {
             if (event.type == SDL_EVENT_QUIT)
                 app_quit = 1;
+            else if (event.type == SDL_EVENT_KEY_DOWN) {
+                int k = event.key.key;
+                if (event.key.key == SDLK_S) {
+                    step = !step;
+                }else if (event.key.key == SDLK_N && step) {
+                    nes_step(nes);
+                }else if (event.key.key == SDLK_R) {
+                    nes_reset(nes);
+                }else if (k == SDLK_M) {
+                    debug_info->mem_page  = (debug_info->mem_page + 1) % 8;
+                }else if (k == SDLK_L) {
+                    nes_line(nes);
+                }else if (k == SDLK_F) {
+                    nes_frame(nes);
+                }
+            }
             break;
         }
-        nes_clock(nes);
-        SDL_SetRenderDrawColor(renderer, 0x0, 0, 0x0, 255);
-        SDL_RenderClear(renderer);
-        //show_text(renderer, font, 100, 100, "hello");
+        {
+            uint64_t e = time_ns();
+            SDL_Color white = {0xff, 0xff, 0xff};
+            char buff [50] = {0};
+            sprintf(buff, "%lld", ((uint64_t)(e-s))/1000000);
 
-        ppu_show_pattern_table(nes->ppu, renderer, 0, w-512, h-256);
-        ppu_show_pattern_table(nes->ppu, renderer, 1, w-256, h-256);
+            //show_text(renderer, font, 0, 0, white, buff);
+        }
         SDL_RenderPresent(renderer);
-        
-        SDL_Delay(16); 
+        SDL_Delay(10);
     }
 
 
+    destroy_debug_info(debug_info);
     rom_destroy(rom);
     sdl_output_destroy(sdl_output);
     device_destroy(output);

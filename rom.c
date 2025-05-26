@@ -1,6 +1,7 @@
 
 #include "rom.h"
 #include "nes.h"
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -61,6 +62,15 @@ rom_t * rom_load(char * path)
     rom->chr_rom = (uint8_t*)malloc(chr_size);
     fread(rom->prg_rom, prg_size, 1, fp);
     fread(rom->chr_rom, chr_size, 1, fp);
+
+    for (uint16_t b = 0; b < prg_size; b += 0x10) {
+        printf("%04X ", b+0x8000);
+        for (uint16_t p = 0; p < 0x10; p ++) {
+            uint8_t byte = rom->prg_rom[b+p];
+            printf("%02X ", byte);
+        }
+        printf("\n");
+    }
     fclose(fp);
     return rom;
 }
