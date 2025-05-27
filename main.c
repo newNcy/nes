@@ -1,7 +1,4 @@
 #include "nes.h"
-#include <complex.h>
-#include <iso646.h>
-#include <stdatomic.h>
 #include <stdint.h> 
 #include <string.h>
 #include <stdio.h>
@@ -483,6 +480,7 @@ typedef struct {
     int8_t rel;
     uint32_t debug_ins_count;
     cpu_debug_stack_frame_t * debug_call_stack;
+    int8_t stoped;
 }cpu_t;
 
 
@@ -918,8 +916,8 @@ uint8_t cpu_fetch_inst(cpu_t * cpu)
 
 static inline void cpu_status_set_zn(cpu_t * cpu, uint8_t res)
 {
-    bit_v_set(&cpu->p, Z, res == 0);
-    bit_v_set(&cpu->p, N, res & 0x80);
+    bit_set_value(&cpu->p, Z, res == 0);
+    bit_set_value(&cpu->p, N, res & 0x80);
 }
 
 /* 
@@ -927,12 +925,12 @@ static inline void cpu_status_set_zn(cpu_t * cpu, uint8_t res)
  * */
 static inline void cpu_status_set_v(cpu_t * cpu, uint8_t operand1, uint8_t operand2, uint8_t res)
 {
-    bit_v_set(&cpu->p, V, (~((operand1&0x80) ^ (operand2&0x80))) & ((res & 0x80) ^ (operand1 & 0x80)));
+    bit_set_value(&cpu->p, V, (~((operand1&0x80) ^ (operand2&0x80))) & ((res & 0x80) ^ (operand1 & 0x80)));
 }
 
 static inline void cpu_status_set_c(cpu_t * cpu, uint16_t res)
 {
-    bit_v_set(&cpu->p, C, res > 0xff);
+    bit_set_value(&cpu->p, C, res > 0xff);
 }
 
 void cpu_debug_push_frame(cpu_t * cpu)
@@ -958,14 +956,43 @@ int cpu_branch(cpu_t * cpu, uint8_t value) {
     return 0;
 }
 
+void cpu_compare(cpu_t * cpu, uint8_t v) 
+{
+    uint16_t res = v - cpu_fetch_data(cpu) + bit_get(&cpu->p, C);
+    cpu_status_set_zn(cpu, res);
+    cpu_status_set_c(cpu, res);
+}
+
 int cpu_opps(cpu_t * cpu)
 {
     addressing_mode_t am = cpu->inst->am;
-    if ((am == ABX || am == ABY) && (0xff00 & cpu->base) != (0xff00&cpu->abs)) {
+    if ((am == ABX || am == ABY || am == IZY) && (0xff00 & cpu->base) != (0xff00&cpu->abs)) {
         return 1;
     }
     return 0;
 }
+
+int cpu_op_ror(cpu_t * cpu)
+{
+    uint8_t operand = cpu_fetch_data(cpu);
+    bit_set_value(&cpu->p, C, operand & 0x1);
+    operand >>= 1;
+    operand |= bit_get(&cpu->p, C) << 7;
+    cpu_write_data(cpu, operand);
+    return 0;
+}
+
+int cpu_op_adc(cpu_t * cpu)
+{
+    uint8_t operand = cpu_fetch_data(cpu);
+    uint16_t res = cpu->a + operand + bit_get(&cpu->p, C);
+    cpu_status_set_v(cpu, cpu->a, operand, res);
+    cpu_status_set_c(cpu, res);
+    cpu_status_set_zn(cpu, res);
+    cpu->a = res;
+    return cpu_opps(cpu);
+}
+
 void format_inst(cpu_t * cpu, char * buff) 
 {
     inst_t * inst = cpu->inst;
@@ -1010,25 +1037,155 @@ uint8_t cpu_exec_single(cpu_t * cpu)
 
     char buff[100] = {0};
     format_inst(cpu, buff);
-    //printf("%s\n", buff);
+    printf("%s\n", buff);
     switch(inst->t) {
-        case NOP: 
+        //Logical and arithmetic commands
+        case ORA:
+            cpu->a = cpu->a | cpu_fetch_data(cpu);
+            cpu_status_set_zn(cpu, cpu->a);
             add_cycle = cpu_opps(cpu);
             break;
-        case INC:
-            operand = cpu_fetch_data(cpu) + 1;
-            cpu_status_set_zn(cpu, operand);
-            cpu_write_data(cpu, operand);
+        case AND:
+            cpu->a &= cpu_fetch_data(cpu);
+            cpu_status_set_zn(cpu, cpu->a);
+            add_cycle = cpu_opps(cpu);
+            break;
+        case EOR:
+            cpu->a = cpu->a ^ cpu_fetch_data(cpu);
+            cpu_status_set_zn(cpu, cpu->a);
+            add_cycle = cpu_opps(cpu);
+            break;
+        case ADC:
+            add_cycle = cpu_op_adc(cpu);
+            break;
+        case SBC:
+            operand = cpu_fetch_data(cpu);
+            res = cpu->a - operand - (1 - bit_get(&cpu->p, C));
+            cpu_status_set_v(cpu, operand, cpu->a, res);
+            cpu_status_set_c(cpu, res);
+            cpu_status_set_zn(cpu, res);
+            cpu->a = res;
+            break;
+        case CMP:
+            cpu_compare(cpu, cpu->a);
+            break;
+        case CPX:
+            cpu_compare(cpu, cpu->x);
+            break;
+        case CPY:
+            cpu_compare(cpu, cpu->y);
             break;
         case DEC:
             operand = cpu_fetch_data(cpu) - 1;
             cpu_status_set_zn(cpu, operand);
             cpu_write_data(cpu, operand);
             break;
+        case DEX:
+            cpu->x --;
+            cpu_status_set_zn(cpu, cpu->x);
+            break;
+        case DEY:
+            cpu->y --;
+            cpu_status_set_zn(cpu, cpu->y);
+            break;
+        case INC:
+            operand = cpu_fetch_data(cpu) + 1;
+            cpu_status_set_zn(cpu, operand);
+            cpu_write_data(cpu, operand);
+            break;
+        case INX:
+            cpu->x ++;
+            cpu_status_set_zn(cpu, cpu->x);
+            break;
+        case INY:
+            cpu->y ++;
+            cpu_status_set_zn(cpu, cpu->y);
+            break;
+        case ASL:
+            operand = cpu_fetch_data(cpu);
+            bit_set_value(&cpu->p, C, operand & 0x80);
+            operand <<= 1;
+            cpu_status_set_zn(cpu, operand);
+            cpu_write_data(cpu, operand);
+            break;
+        case ROL:
+            operand = cpu_fetch_data(cpu);
+            bit_set_value(&cpu->p, C, operand& 0x80);
+            operand <<= 1 ;
+            operand |= bit_get(&cpu->p, C);
+            cpu_write_data(cpu, operand);
+            break;
+        case LSR:
+            operand = cpu_fetch_data(cpu);
+            bit_set_value(&cpu->p, C, operand & 0x1);
+            operand >>= 1;
+            cpu_status_set_zn(cpu, operand);
+            cpu_write_data(cpu, operand);
+            break;
+        case ROR:
+            add_cycle = cpu_op_ror(cpu);
+            break;
+        //Move commands
         case LDA:
             cpu->a = cpu_fetch_data(cpu);
             cpu_status_set_zn(cpu, cpu->a);
             break;
+        case STA:
+            cpu_write_data(cpu, cpu->a);
+            break;
+        case LDX:
+            cpu->x = cpu_fetch_data(cpu);
+            cpu_status_set_zn(cpu, cpu->x);
+            break;
+        case STX:
+            cpu_write_data(cpu, cpu->x);
+            break;
+        case LDY:
+            cpu->y = cpu_fetch_data(cpu);
+            cpu_status_set_zn(cpu, cpu->y);
+            break;
+        case STY:
+            cpu_write_data(cpu, cpu->x);
+            break;
+        case TAX:
+            cpu->x = cpu->a;
+            cpu_status_set_zn(cpu, cpu->x);
+            break;
+        case TXA:
+            cpu->a = cpu->x;
+            cpu_status_set_zn(cpu, cpu->a);
+            break;
+        case TAY:
+            cpu->y = cpu->a;
+            cpu_status_set_zn(cpu, cpu->y);
+            break;
+        case TYA:
+            cpu->a = cpu->y;
+            cpu_status_set_zn(cpu, cpu->a);
+            break;
+        case TSX:
+            cpu->x = cpu->s;
+            cpu_status_set_zn(cpu, cpu->x);
+            break;
+        case TXS:
+            cpu->s = cpu->x;
+            break;
+        case PLA:
+            cpu->a = cpu_stack_pop(cpu);
+            cpu_status_set_zn(cpu, cpu->a);
+            break;
+        case PHA:
+            cpu_stack_push(cpu, cpu->a);
+            break;
+        case PLP:
+            operand = bit_get(&cpu->p, B);
+            cpu->p = cpu_stack_pop(cpu);
+            cpu->p |= operand;
+            break;
+        case PHP:
+            cpu_stack_push(cpu, cpu->p);
+            break;
+        //ump/Flag commands
         case BPL:
             add_cycle = cpu_branch(cpu, bit_get(&cpu->p, N) == 0);
             break;
@@ -1075,9 +1232,9 @@ uint8_t cpu_exec_single(cpu_t * cpu)
             break;
         case BIT:
             operand = cpu_fetch_data(cpu);
-            bit_v_set(&cpu->p, N, bit_get((uint8_t*)&operand, 7));
-            bit_v_set(&cpu->p, V, bit_get((uint8_t*)&operand, 6));
-            bit_v_set(&cpu->p, Z, (cpu->a & operand) == 0);
+            bit_set_value(&cpu->p, N, bit_get((uint8_t*)&operand, 7));
+            bit_set_value(&cpu->p, V, bit_get((uint8_t*)&operand, 6));
+            bit_set_value(&cpu->p, Z, (cpu->a & operand) == 0);
             break;
         case CLC:
             bit_clr(&cpu->p, C);
@@ -1100,145 +1257,53 @@ uint8_t cpu_exec_single(cpu_t * cpu)
         case CLV:
             bit_clr(&cpu->p, I);
             break;
-        case STA:
-            cpu_write_data(cpu, cpu->a);
-            break;
-        case SLO:
+        case NOP: 
+            add_cycle = cpu_opps(cpu);
+            break; 
+        //Illegal opcodes
+        case SLO: //asl + or
             operand = cpu_fetch_data(cpu);
+            bit_set_value(&cpu->p, C, operand & 0x80); 
             operand = operand<<1;
-            bit_v_set(&cpu->p, C, operand & 0x80); 
-            cpu_status_set_zn(cpu, operand);
-            break;
-        case LDX:
-            cpu->x = cpu_fetch_data(cpu);
-            cpu_status_set_zn(cpu, cpu->x);
-            break;
-        case TXS:
-            cpu->s = cpu->x;
-            break;
-        case TXA:
-            cpu->a = cpu->x;
-            break;
-        case ORA:
-            operand = cpu->a | cpu_fetch_data(cpu);
-            cpu_status_set_zn(cpu, operand);
-            add_cycle = cpu_opps(cpu);
-            break;
-        case AND:
-            cpu->a &= cpu_fetch_data(cpu);
-            cpu_status_set_zn(cpu, cpu->a);
-            add_cycle = cpu_opps(cpu);
-            break;
-        case EOR:
-            cpu->a = cpu->a ^ cpu_fetch_data(cpu);
-            cpu_status_set_zn(cpu, cpu->a);
-            add_cycle = cpu_opps(cpu);
-            break;
-        case CMP:
-            operand = cpu->a - cpu_fetch_data(cpu);
-            bit_v_set(&cpu->p, C, operand & 0x80); 
-            cpu_status_set_zn(cpu, operand);
-            break;
-        case CPX:
-            operand = cpu->x - cpu_fetch_data(cpu);
-            bit_v_set(&cpu->p, C, operand & 0x80); 
-            cpu_status_set_zn(cpu, operand);
-            break;
-        case CPY:
-            operand = cpu->y - cpu_fetch_data(cpu);
-            bit_v_set(&cpu->p, C, operand & 0x80); 
-            cpu_status_set_zn(cpu, operand);
-            break;
-        case ADC:
-            operand = cpu_fetch_data(cpu);
-            res = cpu->a + operand + bit_get(&cpu->p, C);
-            cpu_status_set_v(cpu, cpu->a, operand, res);
-            cpu_status_set_c(cpu, res);
-            cpu_status_set_zn(cpu, res);
-            cpu->a = res;
-            break;
-        case SBC:
-            operand = cpu_fetch_data(cpu);
-            res = cpu->a - operand + bit_get(&cpu->p, C);;
-            cpu_status_set_v(cpu, operand, cpu->a, res);
-            cpu_status_set_c(cpu, res);
-            cpu_status_set_zn(cpu, res);
-            cpu->a = res;
-            break;
-        case ASL:
-            res = cpu_fetch_data(cpu);
-            res <<= 1;
-            cpu_status_set_c(cpu, res);
-            cpu_status_set_zn(cpu, res);
-
-            cpu_write_data(cpu, res);
-            break;
-        case LSR:
-            operand = cpu_fetch_data(cpu);
-            bit_v_set(&cpu->p, C, operand & 0x1);
-            operand >>= 1;
-            cpu_status_set_zn(cpu, operand);
-
             cpu_write_data(cpu, operand);
+
+            cpu->a |= operand;
+            cpu_status_set_zn(cpu, cpu->a);
             break;
-        case ROL:
+        case RLA:
             operand = cpu_fetch_data(cpu);
-            bit_v_set(&cpu->p, C, operand& 0x80);
-            operand <<= 1 ;
-            operand |= bit_get(&cpu->p, C);
+            bit_set_value(&cpu->p, C, operand & 0x80); 
+            operand = (operand<<1) | bit_get(&cpu->p, C);
             cpu_write_data(cpu, operand);
+            cpu->a &= operand;
+            cpu_status_set_zn(cpu, cpu->a);
             break;
-        case STX:
-            cpu_write_data(cpu, cpu->x);
+        case SRE:
+            operand = cpu_fetch_data(cpu);
+            bit_set_value(&cpu->p, C, operand & 0x1);
+            operand <<= 1;
+            cpu->a ^= operand;
+            cpu_status_set_zn(cpu, cpu->a);
             break;
-        case STY:
-            cpu_write_data(cpu, cpu->x);
+        case RRA:
+            add_cycle = cpu_op_ror(cpu) + cpu_op_adc(cpu);
             break;
-        case LDY:
-            cpu->y = cpu_fetch_data(cpu);
-            cpu_status_set_zn(cpu, cpu->y);
+        case SAX:
+            cpu_write_data(cpu, cpu->a & cpu->x);
             break;
-        case DEY:
-            cpu->y --;
-            cpu_status_set_zn(cpu, cpu->y);
-            break;
-        case INY:
-            cpu->y ++;
-            cpu_status_set_zn(cpu, cpu->y);
-            break;
-        case DEX:
-            cpu->x --;
-            cpu_status_set_zn(cpu, cpu->x);
-            break;
-        case INX:
-            cpu->x ++;
-            cpu_status_set_zn(cpu, cpu->x);
+        case LAX:
+            cpu->a = cpu->x = cpu_fetch_data(cpu);
+            cpu_status_set_zn(cpu, cpu->a);
             break;
         case DCP:
             operand = cpu_fetch_data(cpu) - 1;
             cpu_write_data(cpu, operand);
+            bit_set_value(&cpu->p, C, cpu->a >= operand) ;
             cpu_status_set_zn(cpu, cpu->a - operand);
             break;
-        case PHA:
-            cpu_stack_push(cpu, cpu->a);
+        case STP:
+            cpu->stoped = 1;
             break;
-        case PLA:
-            cpu->a = cpu_stack_pop(cpu);
-            cpu_status_set_zn(cpu, cpu->a);
-            break;
-        case TAX:
-            cpu->x = cpu->a;
-            cpu_status_set_zn(cpu, cpu->x);
-            break;
-        case TAY:
-            cpu->y = cpu->a;
-            cpu_status_set_zn(cpu, cpu->y);
-            break;
-        case TYA:
-            cpu->a = cpu->y;
-            cpu_status_set_zn(cpu, cpu->a);
-            break;
-
         default:
             printf("unsupported %s\n", inst_tag[inst->t]);
             break;
@@ -1281,6 +1346,9 @@ void cpu_debug_show_detail(cpu_t * cpu)
 
 void cpu_clock(cpu_t * cpu)
 {
+    if (cpu->stoped) {
+        return;
+    }
     if (cpu->cycles == 0) {
         if (!cpu->inst) {
             cpu_fetch_inst(cpu);
@@ -1345,11 +1413,7 @@ static inline uint8_t ppu_vt_get_fine_y(uint16_t * reg)
 
 void ppu_register_io(void * device, uint16_t address, uint8_t * byte, uint8_t is_write) 
 {
-    if (address != 7)
-    printf("ppu register io %0X %02x is_write:%d\n", 0x2000 + address, *byte, is_write);
     ppu_t * ppu = (ppu_t*)device;
-
-
     if (is_write) {
         switch(address) {
             case 0: {
@@ -1708,6 +1772,7 @@ void nes_frame(nes_t * nes) {
 
 void nes_reset(nes_t * nes) 
 {
+    nes->cpu->stoped = 0;
     cpu_interupt(nes->cpu, RESET);
     nes_until_inst(nes);
 }

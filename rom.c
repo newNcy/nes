@@ -63,6 +63,7 @@ rom_t * rom_load(char * path)
     fread(rom->prg_rom, prg_size, 1, fp);
     fread(rom->chr_rom, chr_size, 1, fp);
 
+    /*
     for (uint16_t b = 0; b < prg_size; b += 0x10) {
         printf("%04X ", b+0x8000);
         for (uint16_t p = 0; p < 0x10; p ++) {
@@ -71,6 +72,7 @@ rom_t * rom_load(char * path)
         }
         printf("\n");
     }
+    */
     fclose(fp);
     return rom;
 }
